@@ -1,0 +1,7 @@
+model=CV1000-D pc=0c1d7cfc sr=40000101 frames=8000 cycles=175642745 illegal=0 last_illegal=00000000:0000 irq_ack=0 nand=138412032B nand_r=116064000 nand_w=0 blit_ops=0 up=0 draw=0 ymz_writes=14 dma=54955 dma_bytes=116063998 last_dma=b0000000>1301f6be/2112/00004421 assists=548 fpga_bits=2323240 fpga_done=1 fpga_sum=e0 icache=207199361/96 dcache=71352699/10068 stale=815296 cachectl=0 widep0=1 ndata=0 tlb=0/0/428012626:00000000>00000000 unmapped_r=0 last_r=00000000 unmapped_w=0 last_w=00000000:00
+set=ddpsdoj source=/mnt/data/ddpsdoj.zip zip=1 ok=1
+u2 present=1 crc=668e4cd6 expected=668e4cd6 size=138412032 load=138412032 ignore=0
+u4 present=1 crc=e2a4411c expected=e2a4411c size=4194560 load=4194304 ignore=256
+u23 present=1 crc=ac94801c expected=ac94801c size=4194560 load=4194304 ignore=256
+u24 present=1 crc=f593045b expected=f593045b size=4194560 load=4194304 ignore=256
+ddpsdoj romset loaded and CRC matched MAME manifest

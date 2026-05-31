@@ -1,7 +1,22 @@
+/*
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * CV1000 machine scaffold for this ANSI C sandbox.
+ *
+ * MAME-derived behavior in this file is limited to board/reset/scheduler
+ * facts and isolated SH7709S/CV1000 constants from the MAME reference tree.
+ * The DDPSDOJ copied-code accelerators and bounded auto-blit handoff are
+ * local sandbox glue around missing SH7709S cache/MMU/DMAC/IRQ fidelity; they
+ * are not copied MAME framework code.
+ *
+ * See NOTICE and docs/MAME_DERIVED.md for attribution details.
+ */
 #include "emu.h"
 #include "platform.h"
 #include <string.h>
 #include <stdio.h>
+
+#define CV1K_SH_SR_T 0x00000001UL
 
 int cv1k_machine_init(struct cv1k_machine *m, int model)
 {
@@ -189,6 +204,25 @@ void cv1k_machine_reset(struct cv1k_machine *m)
     memset(m->tmu_last_cycles, 0, sizeof(m->tmu_last_cycles));
     m->tmu_last_event = 0UL;
     m->tmu_last_priority = 0UL;
+    m->port_reads_c = 0UL;
+    m->port_reads_d = 0UL;
+    m->port_reads_e = 0UL;
+    m->port_reads_f = 0UL;
+    m->port_reads_l = 0UL;
+    m->port_pc_c = 0UL;
+    m->port_pc_d = 0UL;
+    m->port_pc_e = 0UL;
+    m->port_pc_f = 0UL;
+    m->port_pc_l = 0UL;
+    m->port_last_c = 0xffU;
+    m->port_last_d = 0xffU;
+    m->port_last_e = 0xffU;
+    m->port_last_f = 0xffU;
+    m->port_last_l = 0xffU;
+    m->last_active_pc = 0UL;
+    m->auto_blits = 0UL;
+    m->auto_blit_last_base = 0UL;
+    m->auto_blit_last_end = 0UL;
 }
 
 
@@ -290,8 +324,220 @@ static void cv1k_synthetic_vblank_tick(struct cv1k_machine *m)
      * interrupt frame.
      */
     cv1k_u32 v;
+    cv1k_u32 step;
     v = cv1k_bus_read32(&m->bus, 0x0c002310UL);
-    cv1k_bus_write32(&m->bus, 0x0c002310UL, v + 1UL);
+    step = 1UL;
+    if (m != NULL && m->mame_speedup && m->video.executed_ops != 0UL) step = 256UL;
+    cv1k_bus_write32(&m->bus, 0x0c002310UL, v + step);
+}
+
+static int cv1k_work_ptr_to_offset(const struct cv1k_machine *m, cv1k_u32 ptr, cv1k_u32 *out)
+{
+    cv1k_u32 phys;
+    if (m == NULL || out == NULL) return 0;
+    phys = ptr;
+    if (phys >= 0x80000000UL && phys <= 0xbfffffffUL) phys &= 0x1fffffffUL;
+    if (phys < CV1K_ADDR_WORK_RAM || phys >= CV1K_ADDR_WORK_RAM + m->main_ram_size) return 0;
+    *out = phys - CV1K_ADDR_WORK_RAM;
+    return 1;
+}
+
+static int cv1k_ram_read32_direct(const struct cv1k_machine *m, cv1k_u32 addr, cv1k_u32 *out)
+{
+    cv1k_u32 off;
+    if (m == NULL || out == NULL) return 0;
+    if (!cv1k_work_ptr_to_offset(m, addr, &off)) return 0;
+    if (off + 4UL > m->main_ram_size) return 0;
+    *out = cv1k_be32(&m->main_ram[off]);
+    return 1;
+}
+
+static int cv1k_ddpsdoj_auto_blit_list(struct cv1k_machine *m)
+{
+    cv1k_u32 base_ptr;
+    cv1k_u32 end_ptr;
+    cv1k_u32 base_off;
+    cv1k_u32 end_off;
+    cv1k_u16 op;
+    if (m == NULL || m->main_ram == NULL) return 0;
+    if (!cv1k_ram_read32_direct(m, 0x0c1d1454UL, &base_ptr)) return 0;
+    if (!cv1k_ram_read32_direct(m, 0x0c1d1460UL, &end_ptr)) return 0;
+    if (!cv1k_work_ptr_to_offset(m, base_ptr, &base_off)) return 0;
+    if (!cv1k_work_ptr_to_offset(m, end_ptr, &end_off)) return 0;
+    if (end_off <= base_off || end_off - base_off < 20UL || end_off - base_off > 0x400000UL) return 0;
+    if (base_off + 2UL > m->main_ram_size) return 0;
+    op = cv1k_be16(&m->main_ram[base_off]);
+    if ((op & 0xf000U) != 0x1000U && (op & 0xf000U) != 0x2000U && (op & 0xf000U) != 0xc000U) return 0;
+
+    /* DDPSDOJ's copied renderer builds the normal CV1000 command stream in
+     * RAM, but this standalone SH/IRQ path can miss the later MMIO launch.
+     * Execute only the validated game-built list; the command parser remains
+     * the MAME-derived CV1000 blitter implementation in video.c.
+     */
+    cv1k_video_execute_list_bounded(&m->video, base_off, end_off, m->main_ram, m->main_ram_size, 8192UL);
+    m->auto_blits++;
+    m->auto_blit_last_base = base_off;
+    m->auto_blit_last_end = end_off;
+    return 1;
+}
+
+static int addr_is_work_alias(cv1k_u32 a)
+{
+    if (a >= CV1K_ADDR_WORK_RAM && a < CV1K_ADDR_WORK_RAM + CV1K_MAIN_RAM_D_SIZE) return 1;
+    if (a >= 0x8c000000UL && a < 0x8d000000UL) return 1;
+    if (a >= 0xac000000UL && a < 0xad000000UL) return 1;
+    return 0;
+}
+
+static cv1k_u32 swapw32(cv1k_u32 v)
+{
+    return (v << 16) | ((v >> 16) & 0xffffUL);
+}
+
+static int cv1k_ddpsdoj_accel_text_list(struct cv1k_machine *m)
+{
+    cv1k_u32 src;
+    cv1k_u32 dst;
+    cv1k_u32 cursor;
+    cv1k_u32 step;
+    cv1k_u32 base;
+    cv1k_u32 head;
+    cv1k_u32 dim;
+    cv1k_u32 tint;
+    cv1k_u32 count;
+    cv1k_u8 b;
+    cv1k_u32 post;
+    cv1k_u32 r1;
+    cv1k_u32 val;
+    if (m->cpu.pc != 0x0c1dd7b8UL) return 0;
+    if (cv1k_bus_fetch16(&m->bus, 0x0c1dd7b8UL) != 0x6044U ||
+        cv1k_bus_fetch16(&m->bus, 0x0c1dd7bcUL) != 0x8d36U ||
+        cv1k_bus_fetch16(&m->bus, 0x0c1dd7c0UL) != 0x70e0U ||
+        cv1k_bus_fetch16(&m->bus, 0x0c1dd7f6UL) != 0x6153U ||
+        cv1k_bus_fetch16(&m->bus, 0x0c1dd802UL) != 0xafd9U) return 0;
+    src = m->cpu.r[4];
+    dst = m->cpu.r[7];
+    if (!addr_is_work_alias(src) || !addr_is_work_alias(dst)) return 0;
+    cursor = m->cpu.r[5];
+    step = m->cpu.r[10];
+    base = m->cpu.r[2];
+    head = m->cpu.r[6];
+    dim = m->cpu.r[8];
+    tint = m->cpu.r[9];
+    for (count = 0UL; count < 4096UL; count++) {
+        b = cv1k_bus_read8(&m->bus, src);
+        src++;
+        if (b == 0U) {
+            m->cpu.r[0] = 0UL;
+            m->cpu.r[4] = src;
+            m->cpu.r[5] = cursor;
+            m->cpu.r[7] = dst;
+            m->cpu.sr |= CV1K_SH_SR_T;
+            m->cpu.pc = 0x0c1dd82cUL;
+            m->cpu.cycles += (count + 1UL) * 20UL;
+            m->boot_assists++;
+            return 1;
+        }
+        post = (cv1k_u32)((cv1k_s32)(cv1k_s8)b - 32L);
+        if (post != 0UL) {
+            r1 = post;
+            r1 >>= 2;
+            r1 >>= 2;
+            r1 >>= 1;
+            r1 <<= 2;
+            r1 <<= 1;
+            val = (((post & 0x1fUL) << 3) + base) | swapw32(0x000003f0UL - r1);
+            cv1k_bus_write32(&m->bus, dst, head);
+            cv1k_bus_write32(&m->bus, dst + 4UL, val);
+            cv1k_bus_write32(&m->bus, dst + 8UL, cursor);
+            cv1k_bus_write32(&m->bus, dst + 12UL, dim);
+            cv1k_bus_write32(&m->bus, dst + 16UL, tint);
+            dst += 20UL;
+        }
+        cursor = (cursor & 0xffff0000UL) | ((cursor + step) & 0x0000ffffUL);
+    }
+    return 0;
+}
+
+static int cv1k_ddpsdoj_run_lz_tokens(struct cv1k_machine *m, cv1k_u32 tokens)
+{
+    cv1k_u32 dst;
+    cv1k_u32 bit_count;
+    cv1k_u32 src;
+    cv1k_u32 bits;
+    cv1k_u32 bit_src;
+    cv1k_u32 remain;
+    cv1k_u32 i;
+    cv1k_u32 j;
+    cv1k_u32 word;
+    cv1k_u32 offset;
+    cv1k_u32 len;
+    cv1k_u32 copy_src;
+    cv1k_u8 b;
+    if (tokens < 16UL || tokens > 0x10000UL) return 0;
+    dst = cv1k_bus_read32(&m->bus, 0x0c65e94cUL);
+    bit_count = cv1k_bus_read32(&m->bus, 0x0c65e950UL);
+    src = cv1k_bus_read32(&m->bus, 0x0c65e948UL);
+    bits = cv1k_bus_read32(&m->bus, 0x0c65e954UL);
+    bit_src = cv1k_bus_read32(&m->bus, 0x0c65e944UL);
+    remain = cv1k_bus_read32(&m->bus, 0x0c65e940UL);
+    if (remain <= tokens || remain == 0UL) return 0;
+    if (!addr_is_work_alias(dst) || !addr_is_work_alias(src) || !addr_is_work_alias(bit_src)) return 0;
+    for (i = 0UL; i < tokens; i++) {
+        if (bit_count == 0UL) {
+            bits = ((cv1k_u32)cv1k_bus_read8(&m->bus, bit_src) << 24) |
+                   ((cv1k_u32)cv1k_bus_read8(&m->bus, bit_src + 1UL) << 16) |
+                   ((cv1k_u32)cv1k_bus_read8(&m->bus, bit_src + 2UL) << 8) |
+                   (cv1k_u32)cv1k_bus_read8(&m->bus, bit_src + 3UL);
+            bit_src += 4UL;
+            bit_count = 32UL;
+        }
+        if ((bits & 0x80000000UL) == 0UL) {
+            b = cv1k_bus_read8(&m->bus, src);
+            src++;
+            cv1k_bus_write8(&m->bus, dst, b);
+            dst++;
+        } else {
+            word = ((cv1k_u32)cv1k_bus_read8(&m->bus, src) << 8) | (cv1k_u32)cv1k_bus_read8(&m->bus, src + 1UL);
+            src += 2UL;
+            offset = word >> 5;
+            len = (word & 0x1fUL) + 3UL;
+            if (offset == 0UL || offset > 0x100000UL) return 0;
+            copy_src = dst - offset;
+            for (j = 0UL; j < len; j++) {
+                b = cv1k_bus_read8(&m->bus, copy_src);
+                copy_src++;
+                cv1k_bus_write8(&m->bus, dst, b);
+                dst++;
+            }
+        }
+        bit_count--;
+        bits <<= 1;
+        remain--;
+    }
+    cv1k_bus_write32(&m->bus, 0x0c65e94cUL, dst);
+    cv1k_bus_write32(&m->bus, 0x0c65e948UL, src);
+    cv1k_bus_write32(&m->bus, 0x0c65e950UL, bit_count);
+    cv1k_bus_write32(&m->bus, 0x0c65e954UL, bits);
+    cv1k_bus_write32(&m->bus, 0x0c65e944UL, bit_src);
+    cv1k_bus_write32(&m->bus, 0x0c65e940UL, remain);
+    return 1;
+}
+
+static int cv1k_ddpsdoj_accel_lz_entry(struct cv1k_machine *m)
+{
+    if (m->cpu.pc != 0x0c1fc250UL) return 0;
+    if (cv1k_bus_fetch16(&m->bus, 0x0c1fc250UL) != 0x2f86U ||
+        cv1k_bus_fetch16(&m->bus, 0x0c1fc256UL) != 0x6a43U ||
+        cv1k_bus_fetch16(&m->bus, 0x0c1fc274UL) != 0x2448U ||
+        cv1k_bus_fetch16(&m->bus, 0x0c1fc300UL) != 0x6783U ||
+        cv1k_bus_fetch16(&m->bus, 0x0c1fc2b2UL) != 0xd626U) return 0;
+    if (!cv1k_ddpsdoj_run_lz_tokens(m, m->cpu.r[4])) return 0;
+    m->cpu.r[0] = 1UL;
+    m->cpu.pc = m->cpu.pr;
+    m->cpu.cycles += m->cpu.r[4] * 24UL;
+    m->boot_assists++;
+    return 1;
 }
 
 
@@ -302,6 +548,8 @@ static void cv1k_boot_assist_pre_step(struct cv1k_machine *m)
     cv1k_u32 block;
     cv1k_u32 idx;
     if (m == NULL) return;
+    if (cv1k_ddpsdoj_accel_text_list(m)) return;
+    if (cv1k_ddpsdoj_accel_lz_entry(m)) return;
 
     /* v17 aggressive invalid-target guard.  Some experimental runs still jump
      * through payload-derived high addresses after a NAND/DMAC/cache-coherency
@@ -445,8 +693,7 @@ static void cv1k_boot_assist_pre_step(struct cv1k_machine *m)
      * lacks that exact coherency model, so --aggressive-assists may mark the
      * helper as successful and continue to expose the next blocker. */
     if (m->cpu.r[0] == 0UL && m->cpu.r[6] == 0xa4000020UL &&
-        ((m->cpu.r[2] >= 0x400UL && m->cpu.r[2] < 0x10000UL) ||
-         (m->aggressive_boot_assists && m->cpu.r[2] > 0UL && m->cpu.r[2] < 0x10000UL))) {
+        (m->cpu.r[2] > 0UL && m->cpu.r[2] < 0x10000UL)) {
         /* v50: the same helper can also be reached after the cache-enabled
          * NAND copy path.  It tests a status/result value generated by the
          * preceding SH7709S/DMAC/NAND/cache-coherency sequence.  The standalone
@@ -468,6 +715,58 @@ static void cv1k_boot_assist_pre_step(struct cv1k_machine *m)
             m->cpu.pc = 0x0c30b720UL;
             m->boot_assists++;
         }
+    }
+
+    /* v51 DDPSDOJ copied-overlay RAM-flag wait.  After the second visible
+     * NAND payload phase the cached code at 0c1e3cfc waits for a word flag
+     * whose backing RAM has already been replaced by a newer NAND overlay in
+     * the standalone cache/DMAC model.  MAME's SH7709S/cache path reaches this
+     * wait with the flag cleared.  Recognize only the exact cached instruction
+     * and literal shape and clear the two observed overlay-local wait words.
+     */
+    if ((m->cpu.pc == 0x0c1e3cfeUL || m->cpu.pc == 0x0c1e3d00UL || m->cpu.pc == 0x0c1e3d02UL ||
+         m->cpu.pc == 0x0c1e3d1aUL || m->cpu.pc == 0x0c1e3d1cUL || m->cpu.pc == 0x0c1e3d1eUL) &&
+        cv1k_bus_fetch16(&m->bus, 0x0c1e3cfcUL) == 0xd004U &&
+        cv1k_bus_fetch16(&m->bus, 0x0c1e3cfeUL) == 0x6102U &&
+        cv1k_bus_fetch16(&m->bus, 0x0c1e3d00UL) == 0x2118U &&
+        cv1k_bus_fetch16(&m->bus, 0x0c1e3d02UL) == 0x8ffcU &&
+        cv1k_bus_fetch16(&m->bus, 0x0c1e3d10UL) == 0x0c1eU &&
+        cv1k_bus_fetch16(&m->bus, 0x0c1e3d12UL) == 0x33a0U &&
+        cv1k_bus_fetch16(&m->bus, 0x0c1e3d14UL) == 0x0c1eU &&
+        cv1k_bus_fetch16(&m->bus, 0x0c1e3d16UL) == 0x33b4U) {
+        if ((m->cpu.r[0] == 0x0c1e33a0UL && cv1k_bus_read32(&m->bus, 0x0c1e33a0UL) != 0UL) ||
+            (m->cpu.r[0] == 0x0c1e33b4UL && cv1k_bus_read32(&m->bus, 0x0c1e33b4UL) != 0UL)) {
+            cv1k_bus_write32(&m->bus, m->cpu.r[0], 0UL);
+            m->cpu.r[1] = 0UL;
+            m->cpu.sr |= 1UL;
+            m->boot_assists++;
+        }
+    }
+
+    /* v52 DDPSDOJ copied-overlay blitter/check worker wait.  The ROM/RAM
+     * check frontend at 0c1e41f8 posts a worker flag at 0c3178e4, calls the
+     * MAME idle wait helper, then spins until that flag clears.  In MAME this
+     * is synchronized by the scheduler/work-queue path; the standalone core
+     * reaches the same wait with the flag left nonzero and keeps rechecking
+     * NAND pages without ever polling inputs.  Match only the exact wait-loop
+     * instruction/literal shape and clear the posted flag so the copied overlay
+     * can continue.
+     */
+    if ((m->cpu.pc == 0x0c1e41f8UL || m->cpu.pc == 0x0c1e41fcUL || m->cpu.pc == 0x0c1e41feUL ||
+         m->cpu.pc == 0x0c1e4200UL) &&
+        cv1k_bus_fetch16(&m->bus, 0x0c1e41f8UL) == 0x490bU &&
+        cv1k_bus_fetch16(&m->bus, 0x0c1e41faUL) == 0x64a2U &&
+        cv1k_bus_fetch16(&m->bus, 0x0c1e41fcUL) == 0x6482U &&
+        cv1k_bus_fetch16(&m->bus, 0x0c1e41feUL) == 0x2448U &&
+        cv1k_bus_fetch16(&m->bus, 0x0c1e4200UL) == 0x8bfaU &&
+        cv1k_bus_fetch16(&m->bus, 0x0c1e428cUL) == 0x0c31U &&
+        cv1k_bus_fetch16(&m->bus, 0x0c1e428eUL) == 0x78e4U &&
+        m->cpu.r[8] == 0x0c3178e4UL &&
+        cv1k_bus_read32(&m->bus, 0x0c3178e4UL) != 0UL) {
+        cv1k_bus_write32(&m->bus, 0x0c3178e4UL, 0UL);
+        m->cpu.r[4] = 0UL;
+        m->cpu.sr |= 1UL;
+        m->boot_assists++;
     }
 
     /* v47 DDPSDOJ bounded counter-loop accelerator.  The v46 default path
@@ -598,10 +897,19 @@ void cv1k_machine_step(struct cv1k_machine *m)
 void cv1k_machine_frame(struct cv1k_machine *m)
 {
     cv1k_u32 i;
+    cv1k_u32 illegal_before;
+    cv1k_u32 cycles_before;
     int speedup_skip_once;
     int speedup_did_tick;
+    int speedup_irq;
+    int crossed_vblank;
+    int render_frame;
     speedup_skip_once = cv1k_mame_speedup_idle(m);
     speedup_did_tick = 0;
+    speedup_irq = 0;
+    crossed_vblank = 0;
+    illegal_before = m->cpu.illegal_count;
+    cycles_before = m->cpu.cycles;
     for (i = 0UL; i < 20000UL; i++) {
         if (cv1k_mame_speedup_idle(m)) {
             if (!speedup_skip_once) {
@@ -614,20 +922,35 @@ void cv1k_machine_frame(struct cv1k_machine *m)
         } else {
             speedup_skip_once = 0;
         }
+        if (!cv1k_mame_speedup_idle(m) && (m->cpu.pc < 0x0c1d1340UL || m->cpu.pc > 0x0c1d134cUL)) m->last_active_pc = m->cpu.pc;
         cv1k_machine_step(m);
         if (!cv1k_mame_speedup_idle(m)) speedup_skip_once = 0;
-        if (m->cpu.illegal_count != 0UL) break;
+        if (m->cpu.illegal_count != illegal_before) {
+            illegal_before = m->cpu.illegal_count;
+            break;
+        }
     }
     cv1k_bus_tmu_tick(&m->bus);
     if (m->irq2_enabled) {
-        int irq_pri;
-        irq_pri = cv1k_irq2_priority_from_iprc(m);
-        sh7709s_request_irq_line(&m->cpu, 2, irq_pri);
-        m->irq_requests++;
-        m->irq_last_level = (cv1k_u32)irq_pri;
-        if (m->vblank_irq_and_tick && !speedup_did_tick) cv1k_synthetic_vblank_tick(m);
+        /* SH7709S runs at roughly 200 MHz on CV1000, and MAME's screen
+         * pulse is 60.024 Hz.  A sandbox frame is only a small interpreter
+         * timeslice, so requesting IRQ2 every call floods the boot code long
+         * before the real board would see a video interrupt.
+         */
+        crossed_vblank = (cycles_before / 3332000UL) != (m->cpu.cycles / 3332000UL);
+        speedup_irq = speedup_did_tick && m->video.executed_ops != 0UL && ((m->mame_speedup_spins & 0x3ffUL) == 0UL);
+        if (crossed_vblank || speedup_irq) {
+            int irq_pri;
+            irq_pri = cv1k_irq2_priority_from_iprc(m);
+            sh7709s_request_irq_line(&m->cpu, 2, irq_pri);
+            m->irq_requests++;
+            m->irq_last_level = (cv1k_u32)irq_pri;
+            if (m->vblank_irq_and_tick && !speedup_did_tick) cv1k_synthetic_vblank_tick(m);
+        }
     } else if (!speedup_did_tick) cv1k_synthetic_vblank_tick(m);
-    cv1k_video_frame(&m->video, m->main_ram, m->main_ram_size);
+    render_frame = crossed_vblank || speedup_irq || speedup_did_tick || ((m->frames & 0x3ffUL) == 0UL);
+    if (render_frame && (m->auto_blits == 0UL || ((m->frames & 0x0fUL) == 0UL))) cv1k_ddpsdoj_auto_blit_list(m);
+    if (render_frame) cv1k_video_frame(&m->video, m->main_ram, m->main_ram_size);
     m->frames++;
 }
 
@@ -642,9 +965,11 @@ void cv1k_machine_status(const struct cv1k_machine *m, char *out, cv1k_u32 out_s
         (unsigned long)m->frames,
         (unsigned long)m->cpu.cycles,
         (unsigned long)m->cpu.illegal_count);
-    p += sprintf(p, "last_illegal=%08lx:%04lx irq_ack=%lu nand=%luB nand_r=%lu nand_w=%lu ",
+    p += sprintf(p, "last_illegal=%08lx:%04lx vbr=%08lx spc=%08lx irq_ack=%lu nand=%luB nand_r=%lu nand_w=%lu ",
         (unsigned long)m->cpu.last_illegal_pc,
         (unsigned long)m->cpu.last_illegal_op,
+        (unsigned long)m->cpu.vbr,
+        (unsigned long)m->cpu.spc,
         (unsigned long)m->cpu.irq_ack_count,
         (unsigned long)m->nand.size,
         (unsigned long)m->nand.reads,
@@ -669,6 +994,34 @@ void cv1k_machine_status(const struct cv1k_machine *m, char *out, cv1k_u32 out_s
         (unsigned long)m->dma_timer_active[1],
         (unsigned long)m->dma_timer_active[2],
         (unsigned long)m->dma_timer_active[3]);
+    p += sprintf(p, "scroll=%lu/%lu clip=%lu,%lu,%lu,%lu list=%06lx lup=%06lx:%lu,%lu,%lu,%lu/%lu/%lu ldr=%06lx:%04lx/%04lx:%lu,%lu>%ld,%ld:%lu,%lu/%lu/%lu/%lu fnz=%lu ",
+        (unsigned long)m->video.gfx_scroll_x,
+        (unsigned long)m->video.gfx_scroll_y,
+        (unsigned long)m->video.clip_x,
+        (unsigned long)m->video.clip_y,
+        (unsigned long)m->video.clip_w,
+        (unsigned long)m->video.clip_h,
+        (unsigned long)m->video.last_list_addr,
+        (unsigned long)m->video.last_upload_addr,
+        (unsigned long)m->video.last_upload_x,
+        (unsigned long)m->video.last_upload_y,
+        (unsigned long)m->video.last_upload_w,
+        (unsigned long)m->video.last_upload_h,
+        (unsigned long)m->video.last_upload_nonzero,
+        (unsigned long)m->video.upload_nonzero_total,
+        (unsigned long)m->video.last_draw_addr,
+        (unsigned long)m->video.last_draw_flags,
+        (unsigned long)m->video.last_draw_alpha,
+        (unsigned long)m->video.last_draw_src_x,
+        (unsigned long)m->video.last_draw_src_y,
+        (long)m->video.last_draw_dst_x,
+        (long)m->video.last_draw_dst_y,
+        (unsigned long)m->video.last_draw_w,
+        (unsigned long)m->video.last_draw_h,
+        (unsigned long)m->video.last_draw_src_nonzero,
+        (unsigned long)m->video.last_draw_written,
+        (unsigned long)m->video.last_draw_written_nonzero,
+        (unsigned long)m->video.last_frame_nonzero);
     p += sprintf(p, "last_dma=%08lx>%08lx/%lu/%08lx/m%lu%lu/%08lx np=%lu-%lu nb=%lu-%lu nc=%lu-%lu irq_req=%lu/%lu/%08lx irqcpu=%lu/%lu/%04x ex=%lu/%08lx/%08lx ",
         (unsigned long)m->last_dma_sar,
         (unsigned long)m->last_dma_dar,
@@ -705,7 +1058,7 @@ void cv1k_machine_status(const struct cv1k_machine *m, char *out, cv1k_u32 out_s
         (long)m->video.fpga_firmware_version,
         (unsigned long)m->icache_hits,
         (unsigned long)m->icache_misses);
-    p += sprintf(p, "dcache=%lu/%lu stale=%lu mcache=%d/%lu/%lu/%lu/%lu/%lu/%lu cachectl=%d mtrap=%d mspeed=%d/%lu fulldma=%d mtmu=%d widep0=%d compact400=%d dmasync=%d dmainv=%lu ndata=%d nandcmd=%02lx pg=%lu col=%lu rnd=%lu spr=%lu nmap=%lu/%lu/%lu/%lu ce=%d ",
+    p += sprintf(p, "dcache=%lu/%lu stale=%lu mcache=%d/%lu/%lu/%lu/%lu/%lu/%lu cachectl=%d mtrap=%d mspeed=%d/%lu active=%08lx breg=%08lx/%08lx/%08lx/%08lx autoblit=%lu/%06lx-%06lx fulldma=%d mtmu=%d widep0=%d compact400=%d dmasync=%d dmainv=%lu ndata=%d ports=C%02x/%lu@%08lx D%02x/%lu@%08lx E%02x/%lu@%08lx F%02x/%lu@%08lx L%02x/%lu@%08lx nandcmd=%02lx pg=%lu col=%lu rnd=%lu spr=%lu nmap=%lu/%lu/%lu/%lu ce=%d ",
         (unsigned long)m->dcache_hits,
         (unsigned long)m->dcache_misses,
         (unsigned long)m->dcache_dma_stale,
@@ -720,6 +1073,14 @@ void cv1k_machine_status(const struct cv1k_machine *m, char *out, cv1k_u32 out_s
         m->mame_trapa,
         m->mame_speedup,
         (unsigned long)m->mame_speedup_spins,
+        (unsigned long)m->last_active_pc,
+        (unsigned long)m->video.regs[0x04UL >> 2],
+        (unsigned long)m->video.regs[0x08UL >> 2],
+        (unsigned long)m->video.regs[0x14UL >> 2],
+        (unsigned long)m->video.regs[0x18UL >> 2],
+        (unsigned long)m->auto_blits,
+        (unsigned long)m->auto_blit_last_base,
+        (unsigned long)m->auto_blit_last_end,
         m->mame_full_dmatcr,
         m->mame_tmu_irq,
         m->wide_p0_alias,
@@ -727,6 +1088,11 @@ void cv1k_machine_status(const struct cv1k_machine *m, char *out, cv1k_u32 out_s
         m->dma_cache_sync,
         (unsigned long)m->dma_cache_invalidations,
         m->nand.data_only_reads,
+        (unsigned)m->port_last_c, (unsigned long)m->port_reads_c, (unsigned long)m->port_pc_c,
+        (unsigned)m->port_last_d, (unsigned long)m->port_reads_d, (unsigned long)m->port_pc_d,
+        (unsigned)m->port_last_e, (unsigned long)m->port_reads_e, (unsigned long)m->port_pc_e,
+        (unsigned)m->port_last_f, (unsigned long)m->port_reads_f, (unsigned long)m->port_pc_f,
+        (unsigned)m->port_last_l, (unsigned long)m->port_reads_l, (unsigned long)m->port_pc_l,
         (unsigned long)m->nand.command,
         (unsigned long)m->nand.page,
         (unsigned long)m->nand.column,

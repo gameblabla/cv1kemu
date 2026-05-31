@@ -1,0 +1,5 @@
+Build command:
+
+make clean && make
+
+Result: clean build with ANSI C89 flags and zlib-enabled romset loader.

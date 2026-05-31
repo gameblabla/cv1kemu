@@ -5,7 +5,8 @@
 
 static const char *names[CV1K_INPUT_COUNT] = {
     "p1_up", "p1_down", "p1_left", "p1_right", "p1_b1", "p1_b2", "p1_b3", "p1_b4", "p1_start",
-    "p2_up", "p2_down", "p2_left", "p2_right", "p2_b1", "p2_b2", "p2_b3", "p2_b4", "coin1"
+    "p2_up", "p2_down", "p2_left", "p2_right", "p2_b1", "p2_b2", "p2_b3", "p2_b4", "coin1",
+    "coin2", "p2_start", "service1", "service2", "service3"
 };
 
 void cv1k_input_default(struct cv1k_input *in)
@@ -23,6 +24,11 @@ void cv1k_input_default(struct cv1k_input *in)
     in->keymap[CV1K_IN_P1_B4] = 'i';
     in->keymap[CV1K_IN_P1_START] = '1';
     in->keymap[CV1K_IN_COIN1] = '5';
+    in->keymap[CV1K_IN_COIN2] = '6';
+    in->keymap[CV1K_IN_P2_START] = '2';
+    in->keymap[CV1K_IN_SERVICE1] = '9';
+    in->keymap[CV1K_IN_SERVICE2] = 't';
+    in->keymap[CV1K_IN_SERVICE3] = 'y';
 }
 
 void cv1k_input_set_key(struct cv1k_input *in, int id, int ascii_key)
@@ -48,8 +54,12 @@ cv1k_u8 cv1k_input_port_c(const struct cv1k_input *in)
 {
     cv1k_u8 p;
     p = 0xffU;
+    p = low_if_pressed(p, 0x01U, in->state[CV1K_IN_SERVICE1]);
+    p = low_if_pressed(p, 0x02U, in->state[CV1K_IN_SERVICE2]);
     p = low_if_pressed(p, 0x04U, in->state[CV1K_IN_COIN1]);
+    p = low_if_pressed(p, 0x08U, in->state[CV1K_IN_COIN2]);
     p = low_if_pressed(p, 0x10U, in->state[CV1K_IN_P1_START]);
+    p = low_if_pressed(p, 0x20U, in->state[CV1K_IN_P2_START]);
     return p;
 }
 
@@ -70,8 +80,10 @@ cv1k_u8 cv1k_input_port_d(const struct cv1k_input *in)
 
 cv1k_u8 cv1k_input_port_f(const struct cv1k_input *in)
 {
-    CV1K_UNUSED(in);
-    return 0xffU;
+    cv1k_u8 p;
+    p = 0xffU;
+    p = low_if_pressed(p, 0x02U, in->state[CV1K_IN_SERVICE3]);
+    return p;
 }
 
 cv1k_u8 cv1k_input_port_l(const struct cv1k_input *in)
@@ -102,6 +114,12 @@ static int find_name(const char *s)
         if (strcmp(s, names[i]) == 0) return i;
     }
     return -1;
+}
+
+int cv1k_input_id_from_name(const char *name)
+{
+    if (name == NULL) return -1;
+    return find_name(name);
 }
 
 int cv1k_input_load_map(struct cv1k_input *in, const char *path)

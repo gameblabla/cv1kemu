@@ -1,0 +1,6 @@
+Build verified with:
+
+make clean
+make
+
+SDL3 target not verified in this container because SDL3 development headers are not installed.

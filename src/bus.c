@@ -1,3 +1,20 @@
+/*
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * CV1000 bus and SH7709S peripheral glue for this ANSI C sandbox.
+ *
+ * Portions are adapted from MAME's Cave CV1000 driver and SH-3 device code,
+ * including CV1000 memory/port routing, PORT_J FPGA access, SH7709S internal
+ * register behavior, TMU/INTC details, and bounded DMAC behavior.
+ *
+ * MAME sources include:
+ *   mame-master/src/mame/cave/cv1k.cpp
+ *   mame-master/src/devices/cpu/sh/sh3comn.*
+ *   mame-master/src/devices/cpu/sh/sh4*.*
+ *
+ * MAME license: BSD-3-Clause.  See NOTICE and docs/MAME_DERIVED.md for
+ * source-specific copyright attribution.
+ */
 #include "bus.h"
 #include "emu.h"
 #include "platform.h"
@@ -95,6 +112,7 @@ static void mame_cache_meta_access(struct cv1k_machine *m, cv1k_u32 vaddr, cv1k_
 static void icache_invalidate_line(struct cv1k_machine *m, cv1k_u32 phys);
 static void dcache_invalidate_line_public(struct cv1k_machine *m, cv1k_u32 phys);
 static void dcache_dma_write8(struct cv1k_machine *m, cv1k_u32 phys, cv1k_u8 data);
+static cv1k_u8 cv1k_bus_dma_read8(struct cv1k_machine *m, cv1k_u32 addr);
 static void cv1k_bus_dma_write8(struct cv1k_machine *m, cv1k_u32 addr, cv1k_u8 data);
 static void cv1k_bus_invalidate_dcache_all(struct cv1k_bus *bus);
 static cv1k_u32 tlb_page_size_from_ptel(cv1k_u32 ptel);
@@ -337,8 +355,8 @@ static int dmac_try_fast_nand_data_to_ram(struct cv1k_machine *m, cv1k_u32 *sar,
     if (m == NULL || sar == NULL || dar == NULL) return 0;
     if (unit != 1UL || src_mode != 0UL || dst_mode != 1UL) return 0;
 
-    src_phys = cpu_addr_translate(m, *sar) & 0x1fffffffUL;
-    dst_phys = cpu_addr_translate(m, *dar);
+    src_phys = dmac_physical_am(*sar);
+    dst_phys = dmac_physical_am(*dar);
     if (src_phys != CV1K_ADDR_NAND_IO) return 0;
 
     max_ram = 0UL;
@@ -455,7 +473,7 @@ static void maybe_sh_dma(struct cv1k_machine *m, cv1k_u32 off)
             src_access = sar & 0x1fffffffUL;
             dst_access = dar & 0x1fffffffUL;
             for (j = 0UL; j < unit; j++) {
-                data = cv1k_bus_read8(&m->bus, src_access + j);
+                data = cv1k_bus_dma_read8(m, src_access + j);
                 cv1k_bus_dma_write8(m, dst_access + j, data);
             }
             dmac_post_adjust(&sar, src_mode, unit);
@@ -502,6 +520,20 @@ static cv1k_u8 sh_io_port_r(struct cv1k_machine *m, cv1k_u32 off)
     dmac_complete_timers(m);
     tmu_ch = tmu_channel_from_off(off);
     if (tmu_ch >= 0) tmu_update_channel(m, tmu_ch);
+    /* MAME's sh3_internal_map exposes the actual SH7709 port data
+     * registers in the physical internal register window.  The callback
+     * numbers below (SH3_PORT_C = 0x12*8, etc.) are only the AS_IO routing
+     * IDs used by sh3comn.cpp once PCDR/PDDR/PEDR/PFDR/PJDR/PLDR are read.
+     */
+    switch (off) {
+    case 0x124UL: return cv1k_bus_port_read(&m->bus, 'C'); /* PCDR */
+    case 0x126UL: return cv1k_bus_port_read(&m->bus, 'D'); /* PDDR */
+    case 0x128UL: return cv1k_bus_port_read(&m->bus, 'E'); /* PEDR */
+    case 0x12aUL: return cv1k_bus_port_read(&m->bus, 'F'); /* PFDR */
+    case 0x130UL: return cv1k_video_fpga_read(&m->video);  /* PJDR */
+    case 0x134UL: return cv1k_bus_port_read(&m->bus, 'L'); /* PLDR */
+    default: break;
+    }
     /* MAME's sh3comn.h exposes the SH-3 port callbacks at arbitrary AS_IO
      * offsets: C=0x90, D=0x98, E=0xa0, F=0xa8, J=0xc0, L=0xd0.
      * CV1000 maps PORT_J to the FPGA serial-loading port.  Earlier sandbox
@@ -519,8 +551,6 @@ static cv1k_u8 sh_io_port_r(struct cv1k_machine *m, cv1k_u32 off)
     case 0xd0UL: return cv1k_bus_port_read(&m->bus, 'L');
     default: break;
     }
-    if (off == 0x128UL || off == 0x130UL) return cv1k_video_fpga_read(&m->video);
-
     /* DMAOR is mapped at 0x04000060-0x04000061 in MAME's SH7709S map.
      * Earlier sandbox builds treated these bytes as a generic ready poll and
      * forced zero, which hid the DMA master-enable bit from code that reads
@@ -553,7 +583,7 @@ static void sh_io_port_w(struct cv1k_machine *m, cv1k_u32 off, cv1k_u8 data)
     default:
         break;
     }
-    if (off == 0x128UL || off == 0x130UL) {
+    if (off == 0x130UL) {
         cv1k_video_fpga_write(&m->video, data);
         m->sh_io[off & (CV1K_REGION_SH_IO_SIZE - 1UL)] = data;
         return;
@@ -809,10 +839,16 @@ static void dcache_cpu_write8(struct cv1k_machine *m, cv1k_u32 phys, cv1k_u8 dat
     m->main_ram[phys - CV1K_ADDR_WORK_RAM] = data;
     idx = dcache_index(phys);
     base = dcache_line_base(phys);
-    if (m->dcache_valid[idx] && m->dcache_tag[idx] == base) {
-        off = phys - base;
-        m->dcache_data[idx][off] = data;
+    if (!(m->dcache_valid[idx] && m->dcache_tag[idx] == base)) {
+        /* The SH7709S cache is write-allocate.  DDPSDOJ relies on cleared
+         * RAM lines staying visible through cache after later NAND DMAs
+         * replace the backing RAM underneath copied code/data overlays.
+         */
+        dcache_fill_line(m, phys);
+        m->dcache_misses++;
     }
+    off = phys - base;
+    m->dcache_data[idx][off] = data;
 }
 
 static void dcache_dma_write8(struct cv1k_machine *m, cv1k_u32 phys, cv1k_u8 data)
@@ -825,10 +861,58 @@ static void dcache_dma_write8(struct cv1k_machine *m, cv1k_u32 phys, cv1k_u8 dat
     if (m->dcache_valid[idx] && m->dcache_tag[idx] == base) m->dcache_dma_stale++;
 }
 
+static cv1k_u8 cv1k_bus_dma_read8(struct cv1k_machine *m, cv1k_u32 addr)
+{
+    cv1k_u32 off;
+    cv1k_u32 phys;
+    if (m == NULL) return 0xffU;
+    phys = dmac_physical_am(addr);
+
+    if (in_range(phys, CV1K_ADDR_SH_IO, CV1K_REGION_SH_IO_SIZE)) {
+        return sh_io_port_r(m, phys - CV1K_ADDR_SH_IO);
+    }
+    if (in_range(phys, CV1K_ADDR_BOOT_ROM, CV1K_REGION_BOOT_ROM_SIZE)) {
+        off = phys - CV1K_ADDR_BOOT_ROM;
+        if (off < m->boot_rom_size) return m->boot_rom[off];
+        return 0xffU;
+    }
+    if (in_range(phys, CV1K_ADDR_WORK_RAM, m->main_ram_size)) {
+        return m->main_ram[phys - CV1K_ADDR_WORK_RAM];
+    }
+    if (in_range(phys, CV1K_ADDR_NAND_IO, CV1K_REGION_IO_SIZE)) {
+        off = phys - CV1K_ADDR_NAND_IO;
+        if (off == 0UL) return cv1k_nand_data_r(&m->nand);
+        return 0xffU;
+    }
+    if (in_range(phys, CV1K_ADDR_RTC_EE, CV1K_REGION_IO_SIZE)) {
+        off = phys - CV1K_ADDR_RTC_EE;
+        if (off == 1UL) return (cv1k_u8)(0xfeU | cv1k_rtc9701_read_bit(&m->rtc));
+        return 0x00U;
+    }
+    if (in_range(phys, CV1K_ADDR_BLITTER, CV1K_REGION_BLITTER_SIZE)) {
+        return cv1k_video_read8(&m->video, phys - CV1K_ADDR_BLITTER);
+    }
+    if (in_range(phys, CV1K_ADDR_CACHE, m->cache_ram_size)) {
+        return m->cache_ram[phys - CV1K_ADDR_CACHE];
+    }
+
+    m->unmapped_reads++;
+    m->last_unmapped_read = phys;
+    return 0xffU;
+}
+
 static void cv1k_bus_dma_write8(struct cv1k_machine *m, cv1k_u32 addr, cv1k_u8 data)
 {
+    cv1k_u32 off;
     cv1k_u32 phys;
-    phys = cpu_addr_translate(m, addr);
+    if (m == NULL) return;
+    /* MAME sh4dmac.cpp masks DMA SAR/DAR with SH34_AM and accesses the
+     * program address space directly.  Do not run these addresses through
+     * the CPU P0/TLB compatibility aliases; doing that turns unmapped low
+     * physical destinations into CV1000 work-RAM writes and corrupts the
+     * DDPSDOJ boot stack.
+     */
+    phys = dmac_physical_am(addr);
     if (in_range(phys, CV1K_ADDR_WORK_RAM, m->main_ram_size)) {
         if (m->dcache_enabled) dcache_dma_write8(m, phys, data);
         else m->main_ram[phys - CV1K_ADDR_WORK_RAM] = data;
@@ -844,7 +928,42 @@ static void cv1k_bus_dma_write8(struct cv1k_machine *m, cv1k_u32 addr, cv1k_u8 d
         }
         return;
     }
-    cv1k_bus_write8(&m->bus, addr, data);
+    if (in_range(phys, CV1K_ADDR_SH_IO, CV1K_REGION_SH_IO_SIZE)) {
+        sh_io_port_w(m, phys - CV1K_ADDR_SH_IO, data);
+        return;
+    }
+    if (in_range(phys, CV1K_ADDR_BOOT_ROM, CV1K_REGION_BOOT_ROM_SIZE)) {
+        return;
+    }
+    if (in_range(phys, CV1K_ADDR_NAND_IO, CV1K_REGION_IO_SIZE)) {
+        off = phys - CV1K_ADDR_NAND_IO;
+        if (off == 0UL) cv1k_nand_data_w(&m->nand, data);
+        else if (off == 1UL) cv1k_nand_command_w(&m->nand, data);
+        else if (off == 2UL) cv1k_nand_address_w(&m->nand, data);
+        return;
+    }
+    if (in_range(phys, CV1K_ADDR_YMZ770, CV1K_REGION_IO_SIZE)) {
+        cv1k_ymz770_write(&m->ymz, phys - CV1K_ADDR_YMZ770, data);
+        return;
+    }
+    if (in_range(phys, CV1K_ADDR_RTC_EE, CV1K_REGION_IO_SIZE)) {
+        off = phys - CV1K_ADDR_RTC_EE;
+        if (off == 1UL) cv1k_rtc9701_write_lines(&m->rtc, data, cv1k_now_unix());
+        else if (off == 3UL) cv1k_nand_set_ce(&m->nand, (data & 0x01U) == 0U);
+        return;
+    }
+    if (in_range(phys, CV1K_ADDR_BLITTER, CV1K_REGION_BLITTER_SIZE)) {
+        cv1k_video_write8(&m->video, phys - CV1K_ADDR_BLITTER, data, m->main_ram, m->main_ram_size);
+        return;
+    }
+    if (in_range(phys, CV1K_ADDR_CACHE, m->cache_ram_size)) {
+        m->cache_ram[phys - CV1K_ADDR_CACHE] = data;
+        return;
+    }
+
+    m->unmapped_writes++;
+    m->last_unmapped_write = phys;
+    m->last_unmapped_write_data = (cv1k_u32)data;
 }
 
 cv1k_u8 cv1k_bus_read8(struct cv1k_bus *bus, cv1k_u32 addr)
@@ -1109,14 +1228,43 @@ void cv1k_bus_write32(struct cv1k_bus *bus, cv1k_u32 addr, cv1k_u32 data)
 cv1k_u8 cv1k_bus_port_read(struct cv1k_bus *bus, int port_id)
 {
     struct cv1k_machine *m;
+    cv1k_u8 value;
     m = bus->machine;
     if (m == NULL) return 0xffU;
+    value = 0xffU;
     switch (port_id) {
-    case 'C': return cv1k_input_port_c(&m->input);
-    case 'D': return cv1k_input_port_d(&m->input);
-    case 'E': return (cv1k_u8)((cv1k_nand_is_busy(&m->nand) ? 0x00U : 0x20U) | 0xdfU);
-    case 'F': return cv1k_input_port_f(&m->input);
-    case 'L': return cv1k_input_port_l(&m->input);
-    default: return 0xffU;
+    case 'C':
+        value = cv1k_input_port_c(&m->input);
+        m->port_reads_c++;
+        m->port_last_c = value;
+        m->port_pc_c = m->cpu.pc;
+        break;
+    case 'D':
+        value = cv1k_input_port_d(&m->input);
+        m->port_reads_d++;
+        m->port_last_d = value;
+        m->port_pc_d = m->cpu.pc;
+        break;
+    case 'E':
+        value = (cv1k_u8)((cv1k_nand_is_busy(&m->nand) ? 0x00U : 0x20U) | 0xdfU);
+        m->port_reads_e++;
+        m->port_last_e = value;
+        m->port_pc_e = m->cpu.pc;
+        break;
+    case 'F':
+        value = cv1k_input_port_f(&m->input);
+        m->port_reads_f++;
+        m->port_last_f = value;
+        m->port_pc_f = m->cpu.pc;
+        break;
+    case 'L':
+        value = cv1k_input_port_l(&m->input);
+        m->port_reads_l++;
+        m->port_last_l = value;
+        m->port_pc_l = m->cpu.pc;
+        break;
+    default:
+        break;
     }
+    return value;
 }

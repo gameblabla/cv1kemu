@@ -1,3 +1,16 @@
+/*
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Constants and helpers adapted from MAME's Cave CV1000 video device:
+ *   mame-master/src/mame/cave/cv1k_v.cpp
+ *   mame-master/src/mame/cave/cv1k_v.h
+ *
+ * MAME license: BSD-3-Clause.
+ * MAME copyright-holders: David Haywood, Luca Elia, MetalliC.
+ *
+ * See NOTICE and docs/MAME_DERIVED.md for attribution details.
+ */
+
 #ifndef MAME_CV1K_DERIVED_H
 #define MAME_CV1K_DERIVED_H
 

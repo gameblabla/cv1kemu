@@ -1,0 +1,7 @@
+model=CV1000-D pc=0c30b71a sr=40000101 frames=10000 cycles=459083942 illegal=0 last_illegal=00000000:0000 irq_ack=0 nand=138412032B nand_r=15483241 nand_w=0 blit_ops=1 up=1 draw=0 clip=0 unk=0/0000 bns=346938400 hpen=11394000 of=1 ymz_writes=6 ymz_reg=3 ymz_key=0/0 dma=7207 dma_bytes=15476032 dmat=0000 last_dma=b0000000>007f7d00/2112/00004421/m01/00004422 np=11340-11340 nb=177-177 nc=256-256 irq_req=0/0/00000000 irqcpu=0/0/0430 ex=4/00000160/0000003c tmu=13397/13414/0:00000420/1 assists=7151 fpga_bits=2323240 fpga_done=1 fpga_sum=e0 fpga_fw=-1 icache=310053958/62 dcache=0/0 stale=0 mcache=0/0/0/0/0/0/0 cachectl=0 mtrap=0 mspeed=0/0 fulldma=0 mtmu=0 widep0=0 compact400=0 dmasync=0 dmainv=0 ndata=0 nandcmd=70 pg=11340 col=256 rnd=0 spr=4096 nmap=1024/454/568/36309 ce=1 alias=27317239/125/0/1971/0/0 tlb=0/0/329714284:00000000>00000000 unmapped_r=0 last_r=00000000 unmapped_w=0 last_w=00000000:00
+set=ddpsdoj source=/mnt/data/ddpsdoj.zip zip=1 ok=1
+u2 present=1 crc=668e4cd6 expected=668e4cd6 size=138412032 load=138412032 ignore=0
+u4 present=1 crc=e2a4411c expected=e2a4411c size=4194560 load=4194304 ignore=256
+u23 present=1 crc=ac94801c expected=ac94801c size=4194560 load=4194304 ignore=256
+u24 present=1 crc=f593045b expected=f593045b size=4194560 load=4194304 ignore=256
+ddpsdoj romset loaded and CRC matched MAME manifest

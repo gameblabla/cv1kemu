@@ -1,3 +1,13 @@
+/*
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Small MAME-derived CV1000 helpers used by the sandbox renderer.
+ * Source: mame-master/src/mame/cave/cv1k_v.cpp and cv1k_v.h.
+ * MAME license: BSD-3-Clause.
+ * MAME copyright-holders: David Haywood, Luca Elia, MetalliC.
+ *
+ * See NOTICE and docs/MAME_DERIVED.md for attribution details.
+ */
 #include "mame_cv1k_derived.h"
 
 static cv1k_u8 colrtable[0x20][0x40];

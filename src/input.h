@@ -3,7 +3,7 @@
 
 #include "cv1k_types.h"
 
-#define CV1K_INPUT_COUNT 18
+#define CV1K_INPUT_COUNT 23
 
 enum cv1k_input_id {
     CV1K_IN_P1_UP = 0,
@@ -23,7 +23,12 @@ enum cv1k_input_id {
     CV1K_IN_P2_B2,
     CV1K_IN_P2_B3,
     CV1K_IN_P2_B4,
-    CV1K_IN_COIN1
+    CV1K_IN_COIN1,
+    CV1K_IN_COIN2,
+    CV1K_IN_P2_START,
+    CV1K_IN_SERVICE1,
+    CV1K_IN_SERVICE2,
+    CV1K_IN_SERVICE3
 };
 
 struct cv1k_input {
@@ -39,6 +44,7 @@ cv1k_u8 cv1k_input_port_d(const struct cv1k_input *in);
 cv1k_u8 cv1k_input_port_f(const struct cv1k_input *in);
 cv1k_u8 cv1k_input_port_l(const struct cv1k_input *in);
 const char *cv1k_input_name(int id);
+int cv1k_input_id_from_name(const char *name);
 int cv1k_input_load_map(struct cv1k_input *in, const char *path);
 int cv1k_input_save_map(const struct cv1k_input *in, const char *path);
 

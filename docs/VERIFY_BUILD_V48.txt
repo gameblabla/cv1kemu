@@ -1,0 +1,20 @@
+cc -std=c89 -pedantic -Wall -Wextra -O2  -DCV1K_WITH_ZLIB -Isrc -c src/main.c -o src/main.o
+cc -std=c89 -pedantic -Wall -Wextra -O2  -DCV1K_WITH_ZLIB -Isrc -c src/platform.c -o src/platform.o
+cc -std=c89 -pedantic -Wall -Wextra -O2  -DCV1K_WITH_ZLIB -Isrc -c src/mame_cv1k_derived.c -o src/mame_cv1k_derived.o
+cc -std=c89 -pedantic -Wall -Wextra -O2  -DCV1K_WITH_ZLIB -Isrc -c src/cpu_sh7709s.c -o src/cpu_sh7709s.o
+src/cpu_sh7709s.c: In function 'sh7709s_step':
+src/cpu_sh7709s.c:289:14: warning: unused variable 'ss' [-Wunused-variable]
+  289 |     cv1k_s32 ss;
+      |              ^~
+cc -std=c89 -pedantic -Wall -Wextra -O2  -DCV1K_WITH_ZLIB -Isrc -c src/bus.c -o src/bus.o
+cc -std=c89 -pedantic -Wall -Wextra -O2  -DCV1K_WITH_ZLIB -Isrc -c src/emu.c -o src/emu.o
+cc -std=c89 -pedantic -Wall -Wextra -O2  -DCV1K_WITH_ZLIB -Isrc -c src/nand.c -o src/nand.o
+cc -std=c89 -pedantic -Wall -Wextra -O2  -DCV1K_WITH_ZLIB -Isrc -c src/rtc9701.c -o src/rtc9701.o
+cc -std=c89 -pedantic -Wall -Wextra -O2  -DCV1K_WITH_ZLIB -Isrc -c src/sound_ymz770.c -o src/sound_ymz770.o
+cc -std=c89 -pedantic -Wall -Wextra -O2  -DCV1K_WITH_ZLIB -Isrc -c src/video.c -o src/video.o
+cc -std=c89 -pedantic -Wall -Wextra -O2  -DCV1K_WITH_ZLIB -Isrc -c src/input.c -o src/input.o
+cc -std=c89 -pedantic -Wall -Wextra -O2  -DCV1K_WITH_ZLIB -Isrc -c src/savestate.c -o src/savestate.o
+cc -std=c89 -pedantic -Wall -Wextra -O2  -DCV1K_WITH_ZLIB -Isrc -c src/romset.c -o src/romset.o
+cc -std=c89 -pedantic -Wall -Wextra -O2  -DCV1K_WITH_ZLIB -Isrc -c src/ui_tui.c -o src/ui_tui.o
+cc -std=c89 -pedantic -Wall -Wextra -O2  -DCV1K_WITH_ZLIB -Isrc -c src/ui_sdl3.c -o src/ui_sdl3.o
+cc -std=c89 -pedantic -Wall -Wextra -O2 -o cv1k_sandbox src/main.o src/platform.o src/mame_cv1k_derived.o src/cpu_sh7709s.o src/bus.o src/emu.o src/nand.o src/rtc9701.o src/sound_ymz770.o src/video.o src/input.o src/savestate.o src/romset.o src/ui_tui.o src/ui_sdl3.o  -lz 

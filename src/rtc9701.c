@@ -102,11 +102,12 @@ void cv1k_rtc9701_write_lines(struct cv1k_rtc9701 *rtc, cv1k_u8 data, cv1k_u32 n
 
     new_latch = (cv1k_u8)(data & 1U);
     new_clock = (cv1k_u8)((data >> 1) & 1U);
-    /* MAME's CV1000 output port maps CS as IP_ACTIVE_LOW.  The RTC state
-     * machine shifts only while set_cs_line receives CLEAR_LINE (0), and
-     * resets the command stream while the line is non-zero.
+    /* MAME's CV1000 output port maps CS as IP_ACTIVE_LOW before it reaches
+     * rtc9701_device::set_cs_line.  The RTC state machine shifts only while
+     * set_cs_line receives CLEAR_LINE (0), so invert the raw CV1000 output
+     * bit here instead of treating bit 2 as the line level directly.
      */
-    new_reset = (cv1k_u8)((data & 4U) ? 1U : 0U);
+    new_reset = (cv1k_u8)((data & 4U) ? 0U : 1U);
     rtc->latch = new_latch;
 
     if (new_reset != 0U) {

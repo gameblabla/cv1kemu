@@ -115,6 +115,25 @@ struct cv1k_machine {
     cv1k_u32 tmu_last_event;
     cv1k_u32 tmu_last_priority;
     cv1k_u32 tmu_last_cycles[3];
+    cv1k_u32 port_reads_c;
+    cv1k_u32 port_reads_d;
+    cv1k_u32 port_reads_e;
+    cv1k_u32 port_reads_f;
+    cv1k_u32 port_reads_l;
+    cv1k_u32 port_pc_c;
+    cv1k_u32 port_pc_d;
+    cv1k_u32 port_pc_e;
+    cv1k_u32 port_pc_f;
+    cv1k_u32 port_pc_l;
+    cv1k_u8 port_last_c;
+    cv1k_u8 port_last_d;
+    cv1k_u8 port_last_e;
+    cv1k_u8 port_last_f;
+    cv1k_u8 port_last_l;
+    cv1k_u32 last_active_pc;
+    cv1k_u32 auto_blits;
+    cv1k_u32 auto_blit_last_base;
+    cv1k_u32 auto_blit_last_end;
 };
 
 int cv1k_machine_init(struct cv1k_machine *m, int model);

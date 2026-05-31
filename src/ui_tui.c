@@ -36,7 +36,7 @@ int cv1k_ui_tui_run(struct cv1k_machine *m)
     char arg2[64];
     int n;
     int i;
-    char status[512];
+    char status[4096];
 
     print_menu();
     for (;;) {

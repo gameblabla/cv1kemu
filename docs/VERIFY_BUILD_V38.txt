@@ -1,0 +1,2 @@
+cc -std=c89 -pedantic -Wall -Wextra -O2  -DCV1K_WITH_ZLIB -Isrc -c src/main.c -o src/main.o
+cc -std=c89 -pedantic -Wall -Wextra -O2 -o cv1k_sandbox src/main.o src/platform.o src/mame_cv1k_derived.o src/cpu_sh7709s.o src/bus.o src/emu.o src/nand.o src/rtc9701.o src/sound_ymz770.o src/video.o src/input.o src/savestate.o src/romset.o src/ui_tui.o src/ui_sdl3.o  -lz 

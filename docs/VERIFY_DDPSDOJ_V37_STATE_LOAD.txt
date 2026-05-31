@@ -1,0 +1,9 @@
+T 000000 pc=00000090 op=8ffb r0=00000000 r1=a0030cfc r2=ac030cf8 r3=000080c1 r4=00000000 r5=00000000 r6=00000000 r7=00000000 r8=00000000 r9=00000000 ra=00000000 rb=00000000 rc=00000000 rd=00000000 re=00000000 rf=0d000000 sr=700000f0
+T 000001 pc=0000008a op=6016 r0=00000000 r1=a0030cfc r2=ac030cfc r3=000080c1 r4=00000000 r5=00000000 r6=00000000 r7=00000000 r8=00000000 r9=00000000 ra=00000000 rb=00000000 rc=00000000 rd=00000000 re=00000000 rf=0d000000 sr=700000f0
+model=CV1000-D pc=0000008c sr=700000f0 frames=10 cycles=249985 illegal=0 last_illegal=00000000:0000 irq_ack=0 nand=138412032B nand_r=0 nand_w=0 blit_ops=0 up=0 draw=0 clip=0 unk=0/0000 bns=0 hpen=0 of=0 ymz_writes=0 ymz_reg=0 ymz_key=0/0 dma=0 dma_bytes=0 last_dma=00000000>00000000/0/00000000/m00/00000000 np=0-0 nb=0-0 nc=0-0 irq_req=0/0/00000000 irqcpu=0/0/0000 ex=0/00000000/00000000 assists=0 fpga_bits=1 fpga_done=0 fpga_sum=00 fpga_fw=-1 icache=0/0 dcache=0/0 stale=0 mcache=0/0/0/0/0/0/0 cachectl=0 mtrap=0 mspeed=0/0 widep0=0 compact400=0 dmasync=0 dmainv=0 ndata=0 nandcmd=ff pg=0 col=0 rnd=0 spr=0 nmap=1024/454/568/36309 ce=1 alias=399890/26/0/0/0/0 tlb=0/0/750255:00000000>00000000 unmapped_r=0 last_r=00000000 unmapped_w=0 last_w=00000000:00
+set=ddpsdoj source=/mnt/data/ddpsdoj.zip zip=1 ok=1
+u2 present=1 crc=668e4cd6 expected=668e4cd6 size=138412032 load=138412032 ignore=0
+u4 present=1 crc=e2a4411c expected=e2a4411c size=4194560 load=4194304 ignore=256
+u23 present=1 crc=ac94801c expected=ac94801c size=4194560 load=4194304 ignore=256
+u24 present=1 crc=f593045b expected=f593045b size=4194560 load=4194304 ignore=256
+ddpsdoj romset loaded and CRC matched MAME manifest

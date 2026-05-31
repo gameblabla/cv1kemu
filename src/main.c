@@ -8,6 +8,14 @@
 #include <string.h>
 #include <stdlib.h>
 
+#define MAX_INPUT_SCRIPT_EVENTS 64
+
+struct input_script_event {
+    int id;
+    int start;
+    int duration;
+};
+
 static void usage(void)
 {
     printf("cv1k-sandbox v50 ANSI C / SDL3-targeted emulator scaffold\n");
@@ -17,9 +25,12 @@ static void usage(void)
     printf("  --boot file           load U4 boot/program flash image\n");
     printf("  --nand file           load U2 NAND image\n");
     printf("  --sound file          load U23/U24 concatenated sound data\n");
+    printf("  --eeprom file         load RTC9701 EEPROM data\n");
     printf("  --ram file            preload main RAM for blitter/CPU tests\n");
     printf("  --blit hexaddr        execute a CV1000 blitter operation list in RAM\n");
     printf("  --input-map file      load text key mapping\n");
+    printf("  --tap-input name,start,frames  press an input during headless run\n");
+    printf("  --hold-input name     hold an input during the whole headless run\n");
     printf("  --run-frames n        run without interactive UI\n");
     printf("  --trace-steps n       print CPU PC/opcode/register trace, then exit if no run-frames\n");
     printf("  --trace-fetch         trace cached fetch opcode as well as raw RAM opcode\n");
@@ -34,6 +45,8 @@ static void usage(void)
     printf("  --vblank-irq-and-tick request IRQ2 but retain synthetic vblank RAM tick\n");
     printf("  --nand-scan          print physical NAND/OOB scan summary\n");
     printf("  --dump-ram file      dump a work-RAM slice after running\n");
+    printf("  --dump-nand file     dump the current NAND image after running\n");
+    printf("  --dump-eeprom file   dump the current RTC9701 EEPROM data after running\n");
     printf("  --dump-ram-addr hex  source address/offset for --dump-ram, default 0x0c000000\n");
     printf("  --dump-ram-size n    byte count for --dump-ram, default 0x10000\n");
     printf("  --break-pc hex        step until PC reaches hex before optional trace/run\n");
@@ -78,6 +91,35 @@ static cv1k_u32 parse_u32_arg(const char *text)
     return v;
 }
 
+static int parse_input_event(const char *text, struct input_script_event *ev)
+{
+    char name[64];
+    int start;
+    int duration;
+    int id;
+    if (text == NULL || ev == NULL) return 0;
+    name[0] = '\0';
+    start = 0;
+    duration = 0;
+    if (sscanf(text, "%63[^,],%d,%d", name, &start, &duration) != 3) return 0;
+    id = cv1k_input_id_from_name(name);
+    if (id < 0 || start < 0 || duration <= 0) return 0;
+    ev->id = id;
+    ev->start = start;
+    ev->duration = duration;
+    return 1;
+}
+
+static void apply_input_script(struct cv1k_input *input, const struct input_script_event *events, int count, int frame)
+{
+    int i;
+    if (input == NULL || events == NULL || count <= 0) return;
+    memset(input->state, 0, sizeof(input->state));
+    for (i = 0; i < count; i++) {
+        if (frame >= events[i].start && frame < events[i].start + events[i].duration) input->state[events[i].id] = 1U;
+    }
+}
+
 static void debug_frame_clocked_until(struct cv1k_machine *m, cv1k_u32 target_pc, cv1k_u32 max_frames)
 {
     cv1k_u32 f;
@@ -85,10 +127,12 @@ static void debug_frame_clocked_until(struct cv1k_machine *m, cv1k_u32 target_pc
     cv1k_u32 total;
     total = 0UL;
     for (f = 0UL; f < max_frames && m->cpu.illegal_count == 0UL; f++) {
+        cv1k_u32 cycles_before;
         int speedup_skip_once;
         int speedup_did_tick;
         speedup_skip_once = (m->mame_speedup && (m->cpu.pc == 0x0c1d1346UL || m->cpu.pc == 0x0c1d1348UL));
         speedup_did_tick = 0;
+        cycles_before = m->cpu.cycles;
         for (s = 0UL; s < 20000UL && m->cpu.illegal_count == 0UL; s++) {
             if (m->cpu.pc == target_pc) {
                 printf("run-break-pc hit pc=%08lx frame=%lu step=%lu total=%lu cycles=%lu\n",
@@ -114,15 +158,18 @@ static void debug_frame_clocked_until(struct cv1k_machine *m, cv1k_u32 target_pc
             total++;
         }
         if (m->irq2_enabled) {
-            cv1k_u16 iprc;
-            int irq_pri;
-            iprc = (cv1k_u16)(((cv1k_u16)m->sh_io[0x16] << 8) | (cv1k_u16)m->sh_io[0x17]);
-            irq_pri = (int)((iprc >> 8) & 0x0fU);
-            sh7709s_request_irq_line(&m->cpu, 2, irq_pri);
-            if (m->vblank_irq_and_tick && !speedup_did_tick) {
-                cv1k_u32 v;
-                v = cv1k_bus_read32(&m->bus, 0x0c002310UL);
-                cv1k_bus_write32(&m->bus, 0x0c002310UL, v + 1UL);
+            if (((cycles_before / 3332000UL) != (m->cpu.cycles / 3332000UL)) ||
+                (speedup_did_tick && m->video.executed_ops != 0UL && ((m->mame_speedup_spins & 0x3ffUL) == 0UL))) {
+                cv1k_u16 iprc;
+                int irq_pri;
+                iprc = (cv1k_u16)(((cv1k_u16)m->sh_io[0x16] << 8) | (cv1k_u16)m->sh_io[0x17]);
+                irq_pri = (int)((iprc >> 8) & 0x0fU);
+                sh7709s_request_irq_line(&m->cpu, 2, irq_pri);
+                if (m->vblank_irq_and_tick && !speedup_did_tick) {
+                    cv1k_u32 v;
+                    v = cv1k_bus_read32(&m->bus, 0x0c002310UL);
+                    cv1k_bus_write32(&m->bus, 0x0c002310UL, v + 1UL);
+                }
             }
         } else if (!speedup_did_tick) {
             cv1k_u32 v;
@@ -164,6 +211,8 @@ int main(int argc, char **argv)
     int vblank_irq_and_tick;
     int nand_scan;
     const char *dump_ram;
+    const char *dump_nand;
+    const char *dump_eeprom;
     cv1k_u32 dump_ram_addr;
     cv1k_u32 dump_ram_size;
     int break_requested;
@@ -174,9 +223,11 @@ int main(int argc, char **argv)
     const char *save_state;
     const char *load_state;
     const char *dump_ppm;
+    struct input_script_event input_script[MAX_INPUT_SCRIPT_EVENTS];
+    int input_script_count;
     cv1k_u32 blit_addr;
     int blit_requested;
-    char status[1024];
+    char status[4096];
     char l1[96];
     char l2[96];
     char l3[96];
@@ -208,6 +259,8 @@ int main(int argc, char **argv)
     vblank_irq_and_tick = 0;
     nand_scan = 0;
     dump_ram = NULL;
+    dump_nand = NULL;
+    dump_eeprom = NULL;
     dump_ram_addr = CV1K_ADDR_WORK_RAM;
     dump_ram_size = 0x10000UL;
     break_requested = 0;
@@ -218,6 +271,7 @@ int main(int argc, char **argv)
     save_state = NULL;
     load_state = NULL;
     dump_ppm = NULL;
+    input_script_count = 0;
     blit_addr = 0UL;
     blit_requested = 0;
     have_report = 0;
@@ -258,12 +312,38 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "--sound") == 0 && i + 1 < argc) {
             i++;
             if (!cv1k_machine_load_sound(&m, argv[i])) fprintf(stderr, "warning: failed to load sound: %s\n", argv[i]);
+        } else if (strcmp(argv[i], "--eeprom") == 0 && i + 1 < argc) {
+            i++;
+            if (!cv1k_rtc9701_load_eeprom(&m.rtc, argv[i])) fprintf(stderr, "warning: failed to load eeprom: %s\n", argv[i]);
         } else if (strcmp(argv[i], "--ram") == 0 && i + 1 < argc) {
             i++;
             if (!cv1k_machine_load_ram(&m, argv[i])) fprintf(stderr, "warning: failed to load RAM: %s\n", argv[i]);
         } else if (strcmp(argv[i], "--input-map") == 0 && i + 1 < argc) {
             i++;
             if (!cv1k_input_load_map(&m.input, argv[i])) fprintf(stderr, "warning: failed to load input map: %s\n", argv[i]);
+        } else if (strcmp(argv[i], "--tap-input") == 0 && i + 1 < argc) {
+            i++;
+            if (input_script_count >= MAX_INPUT_SCRIPT_EVENTS || !parse_input_event(argv[i], &input_script[input_script_count])) {
+                fprintf(stderr, "warning: bad input event: %s\n", argv[i]);
+            } else {
+                input_script_count++;
+            }
+        } else if (strcmp(argv[i], "--hold-input") == 0 && i + 1 < argc) {
+            i++;
+            if (input_script_count >= MAX_INPUT_SCRIPT_EVENTS) {
+                fprintf(stderr, "warning: too many input events\n");
+            } else {
+                int id;
+                id = cv1k_input_id_from_name(argv[i]);
+                if (id < 0) {
+                    fprintf(stderr, "warning: bad input name: %s\n", argv[i]);
+                } else {
+                    input_script[input_script_count].id = id;
+                    input_script[input_script_count].start = 0;
+                    input_script[input_script_count].duration = 0x7fffffff;
+                    input_script_count++;
+                }
+            }
         } else if (strcmp(argv[i], "--run-frames") == 0 && i + 1 < argc) {
             i++;
             run_frames = atoi(argv[i]);
@@ -302,6 +382,12 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "--dump-ram") == 0 && i + 1 < argc) {
             i++;
             dump_ram = argv[i];
+        } else if (strcmp(argv[i], "--dump-nand") == 0 && i + 1 < argc) {
+            i++;
+            dump_nand = argv[i];
+        } else if (strcmp(argv[i], "--dump-eeprom") == 0 && i + 1 < argc) {
+            i++;
+            dump_eeprom = argv[i];
         } else if (strcmp(argv[i], "--dump-ram-addr") == 0 && i + 1 < argc) {
             i++;
             dump_ram_addr = parse_u32_arg(argv[i]);
@@ -420,7 +506,10 @@ int main(int argc, char **argv)
         }
         cv1k_ui_sdl3_run(&m);
     } else if (run_frames >= 0) {
-        for (i = 0; i < run_frames; i++) cv1k_machine_frame(&m);
+        for (i = 0; i < run_frames; i++) {
+            apply_input_script(&m.input, input_script, input_script_count, i);
+            cv1k_machine_frame(&m);
+        }
         if (probe_requested) {
             compact_line(have_report ? &rr : NULL, l1, l2, l3);
             cv1k_machine_render_probe(&m, l1, l2, l3);
@@ -436,6 +525,7 @@ int main(int argc, char **argv)
     }
 
     if (dump_ppm != NULL) {
+        cv1k_video_frame(&m.video, m.main_ram, m.main_ram_size);
         if (!cv1k_video_write_ppm(&m.video, dump_ppm)) fprintf(stderr, "warning: PPM dump failed: %s\n", dump_ppm);
     }
 
@@ -454,6 +544,17 @@ int main(int argc, char **argv)
             if (rf == NULL || fwrite(m.main_ram + roff, 1U, (size_t)rsize, rf) != (size_t)rsize) fprintf(stderr, "warning: RAM dump failed: %s\n", dump_ram);
             if (rf != NULL) fclose(rf);
         }
+    }
+
+    if (dump_nand != NULL) {
+        FILE *nf;
+        nf = fopen(dump_nand, "wb");
+        if (nf == NULL || fwrite(m.nand.data, 1U, (size_t)m.nand.size, nf) != (size_t)m.nand.size) fprintf(stderr, "warning: NAND dump failed: %s\n", dump_nand);
+        if (nf != NULL) fclose(nf);
+    }
+
+    if (dump_eeprom != NULL) {
+        if (!cv1k_rtc9701_save_eeprom(&m.rtc, dump_eeprom)) fprintf(stderr, "warning: EEPROM dump failed: %s\n", dump_eeprom);
     }
 
     if (save_state != NULL) {

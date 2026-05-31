@@ -1,3 +1,19 @@
+/*
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * CV1000 blitter/video scaffold for this ANSI C sandbox.
+ *
+ * Portions are adapted from MAME's Cave CV1000 video implementation:
+ *   mame-master/src/mame/cave/cv1k_v.cpp
+ *   mame-master/src/mame/cave/cv1k_v.h
+ *   mame-master/src/mame/cave/cv1k_v_pixel.ipp
+ *
+ * MAME license: BSD-3-Clause.
+ * MAME copyright-holders: David Haywood, Luca Elia, MetalliC.
+ * The generated pixel-loop fragment additionally names David Haywood.
+ *
+ * See NOTICE and docs/MAME_DERIVED.md for attribution details.
+ */
 #include "video.h"
 #include "platform.h"
 #include "mame_cv1k_derived.h"
@@ -43,22 +59,46 @@ static cv1k_u16 apply_tint(cv1k_u16 src, cv1k_u8 mul_r, cv1k_u8 mul_g, cv1k_u8 m
     return make1555(r, g, b, a);
 }
 
-static cv1k_u8 blend_component(cv1k_u8 s, cv1k_u8 d, cv1k_u8 alpha, int mode)
+static cv1k_u8 dst_mode_component(cv1k_u8 s, cv1k_u8 d, cv1k_u8 alpha, int mode)
 {
-    cv1k_u8 scaled;
-    scaled = cv1k_mame_mul5(s, (cv1k_u8)((alpha >> 3) & 0x3fU));
     switch (mode & 7) {
-    case 0: return cv1k_mame_add5(d, scaled);       /* +alpha */
-    case 1: return cv1k_mame_add5(d, s);            /* +source */
-    case 2: return cv1k_mame_add5(d, d);            /* +destination */
-    case 4: return (d > scaled) ? (cv1k_u8)(d - scaled) : 0U;
-    case 5: return (d > s) ? (cv1k_u8)(d - s) : 0U;
-    case 6: return 0U;
-    default: return s;
+    case 0: return cv1k_mame_mul5(d, alpha);
+    case 1: return cv1k_mame_mul5(s, d);
+    case 2: return cv1k_mame_mul5(d, d);
+    case 4: return cv1k_mame_mul5_rev(alpha, d);
+    case 5: return cv1k_mame_mul5_rev(s, d);
+    case 6: return cv1k_mame_mul5_rev(d, d);
+    default: return d;
     }
 }
 
-static cv1k_u16 blend_pixel(cv1k_u16 src, cv1k_u16 dst, cv1k_u8 src_alpha, int src_mode, int dst_mode)
+static cv1k_u8 blend_component_mame(cv1k_u8 s, cv1k_u8 d, cv1k_u8 src_alpha, cv1k_u8 dst_alpha, int src_mode, int dst_mode)
+{
+    cv1k_u8 left;
+    cv1k_u8 right;
+    if ((src_mode & 7) == 0) {
+        left = cv1k_mame_mul5(s, src_alpha);
+        right = dst_mode_component(s, d, dst_alpha, dst_mode);
+        return cv1k_mame_add5(left, right);
+    }
+    if ((src_mode & 7) == 2) {
+        left = cv1k_mame_mul5(d, s);
+        if ((dst_mode & 7) == 0) right = cv1k_mame_mul5(d, dst_alpha);
+        else right = dst_mode_component(s, d, dst_alpha, dst_mode);
+        return cv1k_mame_add5(left, right);
+    }
+    switch (src_mode & 7) {
+    case 1: left = cv1k_mame_mul5(s, s); break;
+    case 4: left = cv1k_mame_mul5_rev(src_alpha, s); break;
+    case 5: left = cv1k_mame_mul5_rev(s, s); break;
+    case 6: left = cv1k_mame_mul5_rev(d, s); break;
+    default: left = s; break;
+    }
+    right = dst_mode_component(s, d, dst_alpha, dst_mode);
+    return cv1k_mame_add5(left, right);
+}
+
+static cv1k_u16 blend_pixel(cv1k_u16 src, cv1k_u16 dst, cv1k_u8 src_alpha, cv1k_u8 dst_alpha, int src_mode, int dst_mode)
 {
     cv1k_u8 sr;
     cv1k_u8 sg;
@@ -69,16 +109,15 @@ static cv1k_u16 blend_pixel(cv1k_u16 src, cv1k_u16 dst, cv1k_u8 src_alpha, int s
     cv1k_u8 rr;
     cv1k_u8 rg;
     cv1k_u8 rb;
-    CV1K_UNUSED(dst_mode);
     sr = (cv1k_u8)((src >> 10) & 0x1fU);
     sg = (cv1k_u8)((src >> 5) & 0x1fU);
     sb = (cv1k_u8)(src & 0x1fU);
     dr = (cv1k_u8)((dst >> 10) & 0x1fU);
     dg = (cv1k_u8)((dst >> 5) & 0x1fU);
     db = (cv1k_u8)(dst & 0x1fU);
-    rr = blend_component(sr, dr, src_alpha, src_mode);
-    rg = blend_component(sg, dg, src_alpha, src_mode);
-    rb = blend_component(sb, db, src_alpha, src_mode);
+    rr = blend_component_mame(sr, dr, src_alpha, dst_alpha, src_mode, dst_mode);
+    rg = blend_component_mame(sg, dg, src_alpha, dst_alpha, src_mode, dst_mode);
+    rb = blend_component_mame(sb, db, src_alpha, dst_alpha, src_mode, dst_mode);
     return make1555(rr, rg, rb, 1U);
 }
 
@@ -153,6 +192,31 @@ void cv1k_video_reset(struct cv1k_video *video)
     video->clip_y = 0UL;
     video->clip_w = CV1K_SCREEN_W;
     video->clip_h = CV1K_SCREEN_H;
+    video->last_list_addr = 0UL;
+    video->last_upload_addr = 0UL;
+    video->last_upload_x = 0UL;
+    video->last_upload_y = 0UL;
+    video->last_upload_w = 0UL;
+    video->last_upload_h = 0UL;
+    video->last_upload_pixels = 0UL;
+    video->last_upload_nonzero = 0UL;
+    video->upload_nonzero_total = 0UL;
+    video->last_draw_addr = 0UL;
+    video->last_draw_flags = 0UL;
+    video->last_draw_alpha = 0UL;
+    video->last_draw_src_x = 0UL;
+    video->last_draw_src_y = 0UL;
+    video->last_draw_dst_x = 0;
+    video->last_draw_dst_y = 0;
+    video->last_draw_w = 0UL;
+    video->last_draw_h = 0UL;
+    video->last_draw_src_nonzero = 0UL;
+    video->last_draw_written = 0UL;
+    video->last_draw_written_nonzero = 0UL;
+    video->draw_src_nonzero_total = 0UL;
+    video->draw_written_total = 0UL;
+    video->draw_written_nonzero_total = 0UL;
+    video->last_frame_nonzero = 0UL;
     video->busy = 0U;
     video->fpga_firmware_pos = 0UL;
     video->fpga_firmware_checksum = 0UL;
@@ -334,20 +398,31 @@ static cv1k_u32 execute_upload(struct cv1k_video *video, cv1k_u32 addr, const cv
     cv1k_u32 py;
     cv1k_u32 pos;
     cv1k_u16 pen;
+    cv1k_u32 nonzero;
     dst_x = (cv1k_u32)(read_ram16(ram, ram_size, addr + 8UL) & 0x1fffU);
     dst_y = (cv1k_u32)(read_ram16(ram, ram_size, addr + 10UL) & 0x0fffU);
     w = (cv1k_u32)(read_ram16(ram, ram_size, addr + 12UL) & 0x1fffU) + 1UL;
     h = (cv1k_u32)(read_ram16(ram, ram_size, addr + 14UL) & 0x0fffU) + 1UL;
     pos = addr + CV1K_UPLOAD_HEADER_SIZE_BYTES;
+    nonzero = 0UL;
     if (w > CV1K_VRAM_W) w = CV1K_VRAM_W;
     if (h > CV1K_VRAM_H) h = CV1K_VRAM_H;
+    video->last_upload_addr = addr;
+    video->last_upload_x = dst_x;
+    video->last_upload_y = dst_y;
+    video->last_upload_w = w;
+    video->last_upload_h = h;
+    video->last_upload_pixels = w * h;
     for (py = 0UL; py < h; py++) {
         for (px = 0UL; px < w; px++) {
             pen = read_ram16(ram, ram_size, pos);
             pos += 2UL;
+            if ((pen & 0x7fffU) != 0U) nonzero++;
             if (video->vram1555 != NULL) video->vram1555[vram_index(dst_x + px, dst_y + py)] = pen;
         }
     }
+    video->last_upload_nonzero = nonzero;
+    video->upload_nonzero_total += nonzero;
     video->upload_ops++;
     video->busy_cycles_ns += (((CV1K_UPLOAD_HEADER_SIZE_BYTES + w * h * 2UL) / 4UL) * CV1K_SRAM_CLK_NANOSEC);
     video->blit_idle_op_bytes = 0UL;
@@ -365,8 +440,10 @@ static cv1k_u32 execute_draw(struct cv1k_video *video, cv1k_u32 addr, const cv1k
     cv1k_u32 w;
     cv1k_u32 h;
     cv1k_u8 src_alpha;
+    cv1k_u8 dst_alpha;
     cv1k_u8 src_mode;
     cv1k_u8 dst_mode;
+    int blend_enabled;
     cv1k_u8 mul_r;
     cv1k_u8 mul_g;
     cv1k_u8 mul_b;
@@ -384,6 +461,9 @@ static cv1k_u32 execute_draw(struct cv1k_video *video, cv1k_u32 addr, const cv1k
     cv1k_s32 dy;
     cv1k_u16 src;
     cv1k_u16 dst;
+    cv1k_u32 src_nonzero;
+    cv1k_u32 written;
+    cv1k_u32 written_nonzero;
     flags = read_ram16(ram, ram_size, addr + 0UL);
     alphaw = read_ram16(ram, ram_size, addr + 2UL);
     src_x = (cv1k_u32)(read_ram16(ram, ram_size, addr + 4UL) & 0x1fffU);
@@ -395,11 +475,26 @@ static cv1k_u32 execute_draw(struct cv1k_video *video, cv1k_u32 addr, const cv1k
     mul_r = (cv1k_u8)(read_ram16(ram, ram_size, addr + 16UL) & 0xffU);
     mul_g = (cv1k_u8)((read_ram16(ram, ram_size, addr + 18UL) >> 8) & 0xffU);
     mul_b = (cv1k_u8)(read_ram16(ram, ram_size, addr + 18UL) & 0xffU);
-    src_alpha = (cv1k_u8)((alphaw >> 8) & 0xffU);
+    src_alpha = (cv1k_u8)(((alphaw >> 8) & 0xffU) >> 3);
+    dst_alpha = (cv1k_u8)((alphaw & 0xffU) >> 3);
     src_mode = (cv1k_u8)((flags >> 4) & 7U);
     dst_mode = (cv1k_u8)(flags & 7U);
+    blend_enabled = ((flags & 0x0200U) != 0U) ? 1 : 0;
+    if (src_mode == 0U && src_alpha == 0x1fU && dst_mode == 4U && dst_alpha == 0x1fU) blend_enabled = 0;
     if (w > CV1K_VRAM_W) w = CV1K_VRAM_W;
     if (h > CV1K_VRAM_H) h = CV1K_VRAM_H;
+    video->last_draw_addr = addr;
+    video->last_draw_flags = (cv1k_u32)flags;
+    video->last_draw_alpha = (cv1k_u32)alphaw;
+    video->last_draw_src_x = src_x;
+    video->last_draw_src_y = src_y;
+    video->last_draw_dst_x = dst_x;
+    video->last_draw_dst_y = dst_y;
+    video->last_draw_w = w;
+    video->last_draw_h = h;
+    src_nonzero = 0UL;
+    written = 0UL;
+    written_nonzero = 0UL;
     for (py = 0UL; py < h; py++) {
         sy = ((flags & 0x0400U) != 0U) ? (src_y + (h - 1UL - py)) : (src_y + py);
         dy = dst_y + (cv1k_s32)py;
@@ -411,15 +506,24 @@ static cv1k_u32 execute_draw(struct cv1k_video *video, cv1k_u32 addr, const cv1k
             if ((cv1k_u32)dx < video->clip_x || (cv1k_u32)dy < video->clip_y) continue;
             if ((cv1k_u32)dx >= video->clip_x + video->clip_w || (cv1k_u32)dy >= video->clip_y + video->clip_h) continue;
             src = video->vram1555[vram_index(sx, sy)];
+            if ((src & 0x7fffU) != 0U) src_nonzero++;
             if ((flags & 0x0100U) != 0U && (src & 0x8000U) == 0U) continue;
             src = apply_tint(src, mul_r, mul_g, mul_b);
-            if ((flags & 0x0200U) != 0U) {
+            if (blend_enabled) {
                 dst = video->vram1555[vram_index((cv1k_u32)dx, (cv1k_u32)dy)];
-                src = blend_pixel(src, dst, src_alpha, (int)src_mode, (int)dst_mode);
+                src = blend_pixel(src, dst, src_alpha, dst_alpha, (int)src_mode, (int)dst_mode);
             }
             video->vram1555[vram_index((cv1k_u32)dx, (cv1k_u32)dy)] = src;
+            written++;
+            if ((src & 0x7fffU) != 0U) written_nonzero++;
         }
     }
+    video->last_draw_src_nonzero = src_nonzero;
+    video->last_draw_written = written;
+    video->last_draw_written_nonzero = written_nonzero;
+    video->draw_src_nonzero_total += src_nonzero;
+    video->draw_written_total += written;
+    video->draw_written_nonzero_total += written_nonzero;
     /* MAME estimates draw time from clipped source/destination VRAM row
      * accesses and 4-pixel DDR transfers.  The pixel loop above is still the
      * sandbox renderer, but the timing/accounting path now follows
@@ -458,27 +562,66 @@ static cv1k_u32 execute_draw(struct cv1k_video *video, cv1k_u32 addr, const cv1k
     return addr + CV1K_DRAW_OPERATION_SIZE_BYTES;
 }
 
-static void cv1k_video_execute_list_from(struct cv1k_video *video, cv1k_u32 addr, const cv1k_u8 *ram, cv1k_u32 ram_size, cv1k_u32 max_ops)
+static int bounded_command_fits(cv1k_u32 addr, cv1k_u32 end_addr, cv1k_u32 need)
+{
+    return end_addr > addr && need <= end_addr - addr;
+}
+
+static int bounded_upload_fits(cv1k_u32 addr, cv1k_u32 end_addr, const cv1k_u8 *ram, cv1k_u32 ram_size)
+{
+    cv1k_u32 w;
+    cv1k_u32 h;
+    cv1k_u32 pixels;
+    cv1k_u32 need;
+    if (!bounded_command_fits(addr, end_addr, CV1K_UPLOAD_HEADER_SIZE_BYTES)) return 0;
+    w = (cv1k_u32)(read_ram16(ram, ram_size, addr + 12UL) & 0x1fffU) + 1UL;
+    h = (cv1k_u32)(read_ram16(ram, ram_size, addr + 14UL) & 0x0fffU) + 1UL;
+    if (h != 0UL && w > 0xffffffffUL / h) return 0;
+    pixels = w * h;
+    if (pixels > (0xffffffffUL - CV1K_UPLOAD_HEADER_SIZE_BYTES) / 2UL) return 0;
+    need = CV1K_UPLOAD_HEADER_SIZE_BYTES + pixels * 2UL;
+    return bounded_command_fits(addr, end_addr, need);
+}
+
+static void cv1k_video_execute_list_from(struct cv1k_video *video, cv1k_u32 addr, cv1k_u32 end_addr, const cv1k_u8 *ram, cv1k_u32 ram_size, cv1k_u32 max_ops)
 {
     cv1k_u32 i;
     cv1k_u16 op;
+    int bounded;
     if (ram == NULL || ram_size < 2UL) return;
+    bounded = (end_addr > addr && end_addr <= ram_size) ? 1 : 0;
     video->busy = 1U;
     video->busy_cycles_ns = 0UL;
     video->blit_idle_op_bytes = 0UL;
     set_exec_clip_from_regs(video);
     for (i = 0UL; i < max_ops; i++) {
+        if (bounded && !bounded_command_fits(addr, end_addr, 2UL)) break;
         op = read_ram16(ram, ram_size, addr);
         if (op == 0x0000U || op == 0xffffU) break;
         video->executed_ops++;
         switch (op & CV1K_BLIT_OP_MASK) {
         case CV1K_BLIT_OP_UPLOAD:
+            if (bounded && !bounded_upload_fits(addr, end_addr, ram, ram_size)) {
+                finish_blit_delay_mame(video);
+                video->busy = 0U;
+                return;
+            }
             addr = execute_upload(video, addr, ram, ram_size);
             break;
         case CV1K_BLIT_OP_DRAW:
+            if (bounded && !bounded_command_fits(addr, end_addr, CV1K_DRAW_OPERATION_SIZE_BYTES)) {
+                finish_blit_delay_mame(video);
+                video->busy = 0U;
+                return;
+            }
             addr = execute_draw(video, addr, ram, ram_size);
             break;
         case CV1K_BLIT_OP_CLIP:
+            if (bounded && !bounded_command_fits(addr, end_addr, 4UL)) {
+                finish_blit_delay_mame(video);
+                video->busy = 0U;
+                return;
+            }
             apply_clip_command(video, read_ram16(ram, ram_size, addr + 2UL));
             /* MAME reads the opcode word and then the clip parameter word.
              * CV1K_CLIP_OPERATION_SIZE_BYTES is only the idle/timing byte
@@ -500,7 +643,7 @@ static void cv1k_video_execute_list_from(struct cv1k_video *video, cv1k_u32 addr
     video->busy = 0U;
 }
 
-void cv1k_video_execute_list(struct cv1k_video *video, cv1k_u32 addr, const cv1k_u8 *ram, cv1k_u32 ram_size, cv1k_u32 max_ops)
+static void cv1k_video_execute_list_common(struct cv1k_video *video, cv1k_u32 addr, cv1k_u32 end_addr, const cv1k_u8 *ram, cv1k_u32 ram_size, cv1k_u32 max_ops)
 {
     cv1k_u8 *shadow;
     /* MAME snapshots the blit command stream into m_ram16_copy before queuing
@@ -510,14 +653,25 @@ void cv1k_video_execute_list(struct cv1k_video *video, cv1k_u32 addr, const cv1k
      * closely.  Full-RAM snapshotting is deliberately simple and ANSI C.
      */
     if (ram == NULL || ram_size < 2UL) return;
+    video->last_list_addr = addr;
     shadow = (cv1k_u8 *)cv1k_xmalloc(ram_size);
     if (shadow != NULL) {
         memcpy(shadow, ram, (size_t)ram_size);
-        cv1k_video_execute_list_from(video, addr, shadow, ram_size, max_ops);
+        cv1k_video_execute_list_from(video, addr, end_addr, shadow, ram_size, max_ops);
         cv1k_free(shadow);
     } else {
-        cv1k_video_execute_list_from(video, addr, ram, ram_size, max_ops);
+        cv1k_video_execute_list_from(video, addr, end_addr, ram, ram_size, max_ops);
     }
+}
+
+void cv1k_video_execute_list(struct cv1k_video *video, cv1k_u32 addr, const cv1k_u8 *ram, cv1k_u32 ram_size, cv1k_u32 max_ops)
+{
+    cv1k_video_execute_list_common(video, addr, 0UL, ram, ram_size, max_ops);
+}
+
+void cv1k_video_execute_list_bounded(struct cv1k_video *video, cv1k_u32 addr, cv1k_u32 end_addr, const cv1k_u8 *ram, cv1k_u32 ram_size, cv1k_u32 max_ops)
+{
+    cv1k_video_execute_list_common(video, addr, end_addr, ram, ram_size, max_ops);
 }
 
 void cv1k_video_write8(struct cv1k_video *video, cv1k_u32 offset, cv1k_u8 data, const cv1k_u8 *ram, cv1k_u32 ram_size)
@@ -561,6 +715,7 @@ void cv1k_video_frame(struct cv1k_video *video, const cv1k_u8 *ram, cv1k_u32 ram
     cv1k_u32 sx;
     cv1k_u32 sy;
     cv1k_u16 pix;
+    cv1k_u32 frame_nonzero;
     CV1K_UNUSED(ram);
     CV1K_UNUSED(ram_size);
     video->frame_counter++;
@@ -576,17 +731,21 @@ void cv1k_video_frame(struct cv1k_video *video, const cv1k_u8 *ram, cv1k_u32 ram
                 video->screen_rgb[y * CV1K_FRAMEBUFFER_W + x] = (c << 16) | ((c ^ 0x55UL) << 8) | (c ^ 0xaaUL);
             }
         }
+        video->last_frame_nonzero = CV1K_SCREEN_W * CV1K_SCREEN_H;
         return;
     }
 
+    frame_nonzero = 0UL;
     for (y = 0UL; y < CV1K_SCREEN_H; y++) {
-        sy = (y - video->gfx_scroll_y) & (CV1K_VRAM_H - 1UL);
+        sy = (y + CV1K_VRAM_H - (video->gfx_scroll_y & (CV1K_VRAM_H - 1UL))) & (CV1K_VRAM_H - 1UL);
         for (x = 0UL; x < CV1K_SCREEN_W; x++) {
-            sx = (x - video->gfx_scroll_x) & (CV1K_VRAM_W - 1UL);
+            sx = (x + CV1K_VRAM_W - (video->gfx_scroll_x & (CV1K_VRAM_W - 1UL))) & (CV1K_VRAM_W - 1UL);
             pix = video->vram1555[vram_index(sx, sy)];
+            if ((pix & 0x7fffU) != 0U) frame_nonzero++;
             video->screen_rgb[y * CV1K_FRAMEBUFFER_W + x] = rgb1555_to_rgb888(pix);
         }
     }
+    video->last_frame_nonzero = frame_nonzero;
 }
 
 int cv1k_video_write_ppm(const struct cv1k_video *video, const char *path)

@@ -1,0 +1,13 @@
+Verification performed in this sandbox:
+
+Command:
+  ./cv1k_sandbox --model d --romset /mnt/data/ddpsdoj.zip --probe-title --run-frames 0 --dump-ppm ddpsdoj_probe.ppm
+
+Result:
+model=CV1000-D pc=00000000 sr=700000f0 frames=0 cycles=0 illegal=0 nand=138412032B nand_r=0 nand_w=0 blit_ops=0 up=0 draw=0 ymz_writes=0 unmapped_r=0 unmapped_w=0
+set=ddpsdoj source=/mnt/data/ddpsdoj.zip zip=1 ok=1
+u2 present=1 crc=668e4cd6 expected=668e4cd6 size=138412032 load=138412032 ignore=0
+u4 present=1 crc=e2a4411c expected=e2a4411c size=4194560 load=4194304 ignore=256
+u23 present=1 crc=ac94801c expected=ac94801c size=4194560 load=4194304 ignore=256
+u24 present=1 crc=f593045b expected=f593045b size=4194560 load=4194304 ignore=256
+ddpsdoj romset loaded and CRC matched MAME manifest
