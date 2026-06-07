@@ -27,6 +27,12 @@ struct sh7709s_cpu {
     cv1k_u32 irq_level;
     cv1k_u32 irq_event;
     cv1k_u32 irq_ack_count;
+    /* Multi-source interrupt controller: each asserted source keeps its INTEVT2
+     * event code and priority until accepted (external lines) or explicitly
+     * cleared (internal peripherals such as TMU), so vblank IRQ2 and the sound
+     * TMU timer no longer overwrite each other. */
+    cv1k_u32 pend_event[8];
+    cv1k_u32 pend_pri[8];
     cv1k_u32 exception_count;
     cv1k_u32 last_illegal_pc;
     cv1k_u32 last_illegal_op;
@@ -46,5 +52,9 @@ void sh7709s_request_irq_event(struct sh7709s_cpu *cpu, cv1k_u32 event, int prio
 void sh7709s_clear_irq_event(struct sh7709s_cpu *cpu, cv1k_u32 event);
 int sh7709s_step(struct sh7709s_cpu *cpu, struct cv1k_bus *bus);
 void sh7709s_run(struct sh7709s_cpu *cpu, struct cv1k_bus *bus, cv1k_u32 instructions);
+cv1k_u32 sh7709s_run_until_idle(struct sh7709s_cpu *cpu, struct cv1k_bus *bus,
+                                cv1k_u32 cycle_budget, cv1k_u32 idle_pc0, cv1k_u32 idle_pc1);
+cv1k_u32 sh7709s_run_frame(struct sh7709s_cpu *cpu, struct cv1k_bus *bus,
+                           cv1k_u32 cycle_budget, cv1k_u32 tmu_interval);
 
 #endif

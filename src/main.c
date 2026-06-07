@@ -185,6 +185,35 @@ static void debug_frame_clocked_until(struct cv1k_machine *m, cv1k_u32 target_pc
         (unsigned long)m->cpu.pc, (unsigned long)m->frames, (unsigned long)total, (unsigned long)m->cpu.illegal_count);
 }
 
+static void put_u32le(unsigned char *p, cv1k_u32 v)
+{
+    p[0] = (unsigned char)(v & 0xffU);
+    p[1] = (unsigned char)((v >> 8) & 0xffU);
+    p[2] = (unsigned char)((v >> 16) & 0xffU);
+    p[3] = (unsigned char)((v >> 24) & 0xffU);
+}
+
+/* Write a 44-byte canonical PCM WAV header for 16-bit stereo. */
+static void write_wav_header(FILE *f, cv1k_u32 sample_rate, cv1k_u32 channels, cv1k_u32 frames)
+{
+    unsigned char h[44];
+    cv1k_u32 byte_rate = sample_rate * channels * 2UL;
+    cv1k_u32 data_bytes = frames * channels * 2UL;
+    memcpy(h, "RIFF", 4);
+    put_u32le(h + 4, 36UL + data_bytes);
+    memcpy(h + 8, "WAVEfmt ", 8);
+    put_u32le(h + 16, 16UL);
+    h[20] = 1; h[21] = 0;                       /* PCM */
+    h[22] = (unsigned char)channels; h[23] = 0;
+    put_u32le(h + 24, sample_rate);
+    put_u32le(h + 28, byte_rate);
+    h[32] = (unsigned char)(channels * 2UL); h[33] = 0; /* block align */
+    h[34] = 16; h[35] = 0;                      /* bits per sample */
+    memcpy(h + 36, "data", 4);
+    put_u32le(h + 40, data_bytes);
+    fwrite(h, 1, 44, f);
+}
+
 int main(int argc, char **argv)
 {
     struct cv1k_machine m;
@@ -226,6 +255,7 @@ int main(int argc, char **argv)
     const char *save_state;
     const char *load_state;
     const char *dump_ppm;
+    const char *dump_audio;
     struct input_script_event input_script[MAX_INPUT_SCRIPT_EVENTS];
     int input_script_count;
     cv1k_u32 blit_addr;
@@ -258,7 +288,9 @@ int main(int argc, char **argv)
     mame_trapa = 0;
     mame_speedup = 1;
     mame_full_dmatcr = 0;
-    mame_tmu_irq = 0;
+    /* TMU underflow interrupt drives the game's sound engine; the multi-source
+     * INTC now lets it coexist with the vblank IRQ, so enable it by default. */
+    mame_tmu_irq = 1;
     wide_p0_alias = 0;
     compact_400_alias = 0;
     nand_data_only = 0;
@@ -278,6 +310,7 @@ int main(int argc, char **argv)
     save_state = NULL;
     load_state = NULL;
     dump_ppm = NULL;
+    dump_audio = NULL;
     input_script_count = 0;
     blit_addr = 0UL;
     blit_requested = 0;
@@ -379,6 +412,11 @@ int main(int argc, char **argv)
             mame_full_dmatcr = 1;
         } else if (strcmp(argv[i], "--mame-tmu-irq") == 0) {
             mame_tmu_irq = 1;
+        } else if (strcmp(argv[i], "--no-tmu-irq") == 0) {
+            mame_tmu_irq = 0;
+        } else if (strcmp(argv[i], "--dump-audio") == 0 && i + 1 < argc) {
+            i++;
+            dump_audio = argv[i];
         } else if (strcmp(argv[i], "--wide-p0-alias") == 0) {
             wide_p0_alias = 1;
         } else if (strcmp(argv[i], "--compact-400-alias") == 0) {
@@ -544,9 +582,32 @@ int main(int argc, char **argv)
         else cv1k_ui_sdl3_run(&m);
 #endif
     } else if (run_frames >= 0) {
+        FILE *af = NULL;
+        cv1k_u32 a_accum = 0UL;
+        cv1k_u32 a_total = 0UL;
+        if (dump_audio != NULL) {
+            af = fopen(dump_audio, "wb");
+            if (af != NULL) write_wav_header(af, CV1K_YMZ770_CLOCK_HZ / 1024UL, 2UL, 0UL);
+        }
         for (i = 0; i < run_frames; i++) {
             apply_input_script(&m.input, input_script, input_script_count, i);
             cv1k_machine_frame(&m);
+            if (af != NULL) {
+                short abuf[2048];
+                cv1k_u32 n;
+                a_accum += (CV1K_YMZ770_CLOCK_HZ / 1024UL) * 1000UL;
+                n = a_accum / CV1K_REFRESH_MILLIHZ;
+                a_accum -= n * CV1K_REFRESH_MILLIHZ;
+                if (n > 1024UL) n = 1024UL;
+                cv1k_ymz770_mix_s16_stereo(&m.ymz, m.sound_rom, m.sound_rom_size, abuf, n);
+                fwrite(abuf, sizeof(short) * 2U, n, af);
+                a_total += n;
+            }
+        }
+        if (af != NULL) {
+            fseek(af, 0L, SEEK_SET);
+            write_wav_header(af, CV1K_YMZ770_CLOCK_HZ / 1024UL, 2UL, a_total);
+            fclose(af);
         }
         if (probe_requested) {
             compact_line(have_report ? &rr : NULL, l1, l2, l3);

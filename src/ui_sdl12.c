@@ -259,6 +259,8 @@ int cv1k_ui_sdl12_run(struct cv1k_machine *m)
     if (opened > 0) SDL_JoystickEventState(SDL_ENABLE);
 
     running = 1;
+    {
+    Uint32 next_frame = SDL_GetTicks();
     while (running) {
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) {
@@ -284,7 +286,17 @@ int cv1k_ui_sdl12_run(struct cv1k_machine *m)
         cv1k_machine_frame(m);
         queue_frame_audio(&audio);
         present_video(screen, &m->video);
-        SDL_Delay(1);
+
+        /* Pace to the CV1000 refresh (~60.024 Hz).  Without this the loop runs
+         * as fast as the host once the boot CPU load clears, making the game
+         * run far too fast.  Sleep the remainder of the frame budget. */
+        next_frame += 1000U / 60U;
+        {
+            Uint32 now = SDL_GetTicks();
+            if ((Sint32)(next_frame - now) > 0) SDL_Delay(next_frame - now);
+            else next_frame = now;   /* fell behind: resync, don't spiral */
+        }
+    }
     }
 
     if (audio.freq != 0U) SDL_CloseAudio();

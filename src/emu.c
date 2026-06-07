@@ -840,22 +840,38 @@ void cv1k_machine_frame(struct cv1k_machine *m)
      * the game runs its per-frame logic and then spins on the vblank tick
      * word that its own IRQ2 handler maintains.  A cycle guard bounds the
      * loop in case a stall keeps the cycle counter from advancing. */
-    guard = 0UL;
-    while ((cv1k_u32)(m->cpu.cycles - cycles_before) < CV1K_CYCLES_PER_VBLANK) {
-        m->last_active_pc = m->cpu.pc;
-        cv1k_machine_step(m);
-        /* MAME cv1k installs spin_until_interrupt at idle PC 0x0c1d1346: once
-         * the per-frame game logic has parked in this vblank wait loop, the
-         * rest of the frame is pure spin, so jump straight to the vsync IRQ. */
-        if (m->cpu.pc == 0x0c1d1346UL || m->cpu.pc == 0x0c1d1348UL) {
-            m->mame_speedup_spins++;
-            break;
+    /* MAME cv1k installs spin_until_interrupt at idle PC 0x0c1d1346: once the
+     * per-frame game logic has parked in that vblank wait loop, the rest of the
+     * frame is pure spin, so jump straight to the vsync IRQ.  The fast path runs
+     * the whole frame inside the core in a single call (no per-instruction
+     * C-ABI overhead); the per-step loop is only used in boot-assist mode. */
+    if (m->aggressive_boot_assists) {
+        guard = 0UL;
+        while ((cv1k_u32)(m->cpu.cycles - cycles_before) < CV1K_CYCLES_PER_VBLANK) {
+            m->last_active_pc = m->cpu.pc;
+            cv1k_machine_step(m);
+            if (m->cpu.pc == 0x0c1d1346UL || m->cpu.pc == 0x0c1d1348UL) {
+                m->mame_speedup_spins++;
+                break;
+            }
+            if (++guard > (CV1K_CYCLES_PER_VBLANK * 4UL)) break;
         }
-        if (++guard > (CV1K_CYCLES_PER_VBLANK * 4UL)) break;
+        cv1k_bus_tmu_tick(&m->bus);
+    } else if (m->mame_tmu_irq) {
+        /* Sound path: run the full frame, ticking the TMU finely so the sound
+         * timer ISR fires at its true rate.  No idle skip (the ISR must keep
+         * running while the main thread spins in its vblank wait). */
+        sh7709s_run_frame(&m->cpu, &m->bus, CV1K_CYCLES_PER_VBLANK, 2048UL);
+        m->last_active_pc = m->cpu.pc;
+    } else {
+        /* Silent fast path: jump straight to vsync once the game parks in its
+         * vblank-wait idle loop. */
+        sh7709s_run_until_idle(&m->cpu, &m->bus, CV1K_CYCLES_PER_VBLANK, 0x0c1d1346UL, 0x0c1d1348UL);
+        cv1k_bus_tmu_tick(&m->bus);
+        m->last_active_pc = m->cpu.pc;
     }
 
     cv1k_video_tick_cycles(&m->video, m->cpu.cycles - cycles_before);
-    cv1k_bus_tmu_tick(&m->bus);
 
     /* Assert IRQ2 at the vsync pulse (MAME cv1k irq2_line_hold).  The handler
      * is serviced at the start of the next frame, matching hardware. */

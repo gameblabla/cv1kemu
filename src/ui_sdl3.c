@@ -78,7 +78,8 @@ int cv1k_ui_sdl3_run(struct cv1k_machine *m)
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 0;
     }
-    if (!SDL_CreateWindowAndRenderer("CV1000 / ddpsdoj sandbox", (int)(CV1K_SCREEN_W * 2U), (int)(CV1K_SCREEN_H * 2U), 0, &window, &renderer)) {
+    /* Portrait window for the rotated (ROT270) TATE display. */
+    if (!SDL_CreateWindowAndRenderer("CV1000 / ddpsdoj sandbox", (int)(CV1K_SCREEN_H * 2U), (int)(CV1K_SCREEN_W * 2U), 0, &window, &renderer)) {
         fprintf(stderr, "SDL_CreateWindowAndRenderer failed: %s\n", SDL_GetError());
         SDL_Quit();
         return 0;
@@ -123,12 +124,20 @@ int cv1k_ui_sdl3_run(struct cv1k_machine *m)
             }
         }
         cv1k_machine_frame(m);
-        if (m->video.executed_ops == 0UL) cv1k_machine_render_probe(m, "BOOTING PARTIAL SH3 CORE", "F5 SAVE  F8 LOAD  ESC QUIT", "INPUT LIVE VIA SDL3");
         SDL_UpdateTexture(texture, NULL, m->video.screen_rgb, (int)(CV1K_FRAMEBUFFER_W * sizeof(cv1k_u32)));
         SDL_RenderClear(renderer);
-        SDL_RenderTexture(renderer, texture, NULL, NULL);
+        {
+            /* Draw the 320x240 landscape texture rotated 90 deg CW so it fills
+             * the 480x640 portrait window (ROT270 TATE), matching SDL 1.2. */
+            SDL_FRect dst;
+            dst.w = (float)(CV1K_SCREEN_W * 2U);
+            dst.h = (float)(CV1K_SCREEN_H * 2U);
+            dst.x = ((float)(CV1K_SCREEN_H * 2U) - dst.w) * 0.5f;
+            dst.y = ((float)(CV1K_SCREEN_W * 2U) - dst.h) * 0.5f;
+            SDL_RenderTextureRotated(renderer, texture, NULL, &dst, 90.0, NULL, SDL_FLIP_NONE);
+        }
         SDL_RenderPresent(renderer);
-        SDL_Delay(16);
+        SDL_Delay(1000U / 60U);
     }
 
     for (i = 0; i < opened_count; i++) if (opened[i] != NULL) SDL_CloseGamepad(opened[i]);
