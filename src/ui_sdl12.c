@@ -167,8 +167,11 @@ static void put_pixel(SDL_Surface *s, unsigned char *p, cv1k_u32 rgb)
 
 static void present_video(SDL_Surface *screen, const struct cv1k_video *video)
 {
-    cv1k_u32 x;
-    cv1k_u32 y;
+    /* ddpsdoj is a TATE (portrait) game; MAME displays it ROT270.  The raw
+     * CV1000 framebuffer is 320x240 landscape, so rotate it 90 degrees CW into
+     * a 240x320 portrait window: dst(dx,dy) = src((W-1)-dy, dx). */
+    cv1k_u32 dx;
+    cv1k_u32 dy;
     cv1k_u32 sx;
     cv1k_u32 sy;
     unsigned char *base;
@@ -177,13 +180,14 @@ static void present_video(SDL_Surface *screen, const struct cv1k_video *video)
     if (SDL_MUSTLOCK(screen) && SDL_LockSurface(screen) != 0) return;
     base = (unsigned char *)screen->pixels;
     bpp = screen->format->BytesPerPixel;
-    for (y = 0U; y < CV1K_SCREEN_H; y++) {
-        const cv1k_u32 *src = &video->screen_rgb[y * CV1K_FRAMEBUFFER_W];
+    for (dy = 0U; dy < CV1K_SCREEN_W; dy++) {            /* dst height = src width  */
+        cv1k_u32 src_col = (CV1K_SCREEN_W - 1U) - dy;
         for (sy = 0U; sy < CV1K_SDL12_SCALE; sy++) {
-            unsigned char *dstrow = base + (y * CV1K_SDL12_SCALE + sy) * (cv1k_u32)screen->pitch;
-            for (x = 0U; x < CV1K_SCREEN_W; x++) {
+            unsigned char *dstrow = base + (dy * CV1K_SDL12_SCALE + sy) * (cv1k_u32)screen->pitch;
+            for (dx = 0U; dx < CV1K_SCREEN_H; dx++) {    /* dst width  = src height */
+                cv1k_u32 rgb = video->screen_rgb[dx * CV1K_FRAMEBUFFER_W + src_col];
                 for (sx = 0U; sx < CV1K_SDL12_SCALE; sx++) {
-                    put_pixel(screen, dstrow + (x * CV1K_SDL12_SCALE + sx) * (cv1k_u32)bpp, src[x]);
+                    put_pixel(screen, dstrow + (dx * CV1K_SDL12_SCALE + sx) * (cv1k_u32)bpp, rgb);
                 }
             }
         }
@@ -221,8 +225,9 @@ int cv1k_ui_sdl12_run(struct cv1k_machine *m)
     SDL_EnableKeyRepeat(0, 0);
     SDL_ShowCursor(SDL_DISABLE);
 
-    screen = SDL_SetVideoMode((int)(CV1K_SCREEN_W * CV1K_SDL12_SCALE),
-                              (int)(CV1K_SCREEN_H * CV1K_SDL12_SCALE),
+    /* Portrait window for the rotated (ROT270) TATE display. */
+    screen = SDL_SetVideoMode((int)(CV1K_SCREEN_H * CV1K_SDL12_SCALE),
+                              (int)(CV1K_SCREEN_W * CV1K_SDL12_SCALE),
                               32,
                               SDL_SWSURFACE | SDL_DOUBLEBUF);
     if (screen == NULL) {
@@ -277,9 +282,6 @@ int cv1k_ui_sdl12_run(struct cv1k_machine *m)
         }
 
         cv1k_machine_frame(m);
-        if (m->video.executed_ops == 0UL) {
-            cv1k_machine_render_probe(m, "BOOTING PARTIAL SH3 CORE", "F5 SAVE  F8 LOAD  ESC QUIT", "SDL 1.2 VIDEO INPUT AUDIO");
-        }
         queue_frame_audio(&audio);
         present_video(screen, &m->video);
         SDL_Delay(1);

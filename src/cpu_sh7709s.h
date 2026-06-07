@@ -31,6 +31,12 @@ struct sh7709s_cpu {
     cv1k_u32 last_illegal_pc;
     cv1k_u32 last_illegal_op;
     cv1k_u32 irq_delay_slot_guard;
+    /* MAME SH-3 interpreter additions */
+    cv1k_u32 ea;          /* effective-address scratch */
+    cv1k_u32 m_delay;     /* pending delay-slot branch target (0 = none) */
+    cv1k_u32 sleep_mode;  /* 0 normal, 1 sleeping, 2 woke from exception */
+    cv1k_u32 ppc;         /* previous PC (debug) */
+    cv1k_s32 icount;      /* per-step cycle accumulator (negative = consumed) */
 };
 
 void sh7709s_reset(struct sh7709s_cpu *cpu);

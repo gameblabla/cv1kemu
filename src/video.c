@@ -951,9 +951,11 @@ void cv1k_video_frame(struct cv1k_video *video, const cv1k_u8 *ram, cv1k_u32 ram
 
     frame_nonzero = 0UL;
     for (y = 0UL; y < CV1K_SCREEN_H; y++) {
-        sy = (y + CV1K_VRAM_H - (video->gfx_scroll_y & (CV1K_VRAM_H - 1UL))) & (CV1K_VRAM_H - 1UL);
+        /* MAME cv1k screen_update: copyscrollbitmap(dst, src, scroll=-m_gfx_scroll)
+         * => dst(x,y) = src(x + gfx_scroll_x, y + gfx_scroll_y) with wrap. */
+        sy = (y + (video->gfx_scroll_y & (CV1K_VRAM_H - 1UL))) & (CV1K_VRAM_H - 1UL);
         for (x = 0UL; x < CV1K_SCREEN_W; x++) {
-            sx = (x + CV1K_VRAM_W - (video->gfx_scroll_x & (CV1K_VRAM_W - 1UL))) & (CV1K_VRAM_W - 1UL);
+            sx = (x + (video->gfx_scroll_x & (CV1K_VRAM_W - 1UL))) & (CV1K_VRAM_W - 1UL);
             pix = video->vram1555[vram_index(sx, sy)];
             if ((pix & 0x7fffU) != 0U) frame_nonzero++;
             video->screen_rgb[y * CV1K_FRAMEBUFFER_W + x] = rgb1555_to_rgb888(pix);

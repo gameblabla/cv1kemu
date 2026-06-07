@@ -1,0 +1,34 @@
+Verification performed in sandbox for v52 SDL 1.2 backend.
+
+SDL 1.2 source used:
+  /mnt/data/SDL12_sourceode.zip
+
+SDL 1.2 local install build:
+  cd /mnt/data/sdlwork/sdl12/SDL
+  ./configure --prefix=/mnt/data/sdlwork/sdl12_install --disable-shared --enable-static \
+    --disable-alsa --disable-pulseaudio --disable-esd --disable-arts --disable-nas --disable-sndio \
+    --disable-video-x11 --disable-video-dga --disable-video-fbcon --disable-video-directfb --disable-video-svga \
+    --disable-video-opengl --disable-input-tslib --disable-cdrom
+  make depend
+  make -j2
+  make install
+
+Emulator builds:
+  make clean
+  make -j2
+  make sdl12 SDL12_CONFIG=/mnt/data/sdlwork/sdl12_install/bin/sdl-config -j2
+
+Result:
+  default/headless build succeeded
+  SDL 1.2 build succeeded and produced cv1k_sandbox_sdl12
+
+Warnings:
+  src/cpu_sh7709s.c:289:14: warning: unused variable 'ss' [-Wunused-variable]
+  This warning existed before the SDL 1.2/backend work.
+
+SDL 1.2 smoke run:
+  SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy timeout 5s \
+    ./cv1k_sandbox_sdl12 --model d --romset /mnt/data/ddpsdoj.zip --mame-speedup --sdl
+
+Result:
+  process ran until timeout with no SDL init/link error output.

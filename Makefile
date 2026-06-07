@@ -15,7 +15,6 @@ BASE_SRC = \
  src/main.c \
  src/platform.c \
  src/mame_cv1k_derived.c \
- src/cpu_sh7709s.c \
  src/bus.c \
  src/emu.c \
  src/nand.c \
@@ -30,10 +29,12 @@ BASE_SRC = \
 NO_SDL_SRC = $(BASE_SRC) src/ui_sdl3.c src/ui_sdl12.c
 SDL3_SRC = $(BASE_SRC) src/ui_sdl3.c src/ui_sdl12.c
 SDL12_C_SRC = $(BASE_SRC) src/ui_sdl3.c src/ui_sdl12.c
-SDL12_CPP_SRC = src/mame_mpeg_audio.cpp src/ymz770_mame_audio.cpp
+# C++ SH-3 core (MAME-derived) shared by every target
+CORE_CPP = src/sh3_core.cpp
+SDL12_CPP_SRC = src/mame_mpeg_audio.cpp src/ymz770_mame_audio.cpp $(CORE_CPP)
 
-OBJ = $(NO_SDL_SRC:.c=.o)
-SDL3_OBJ = $(SDL3_SRC:.c=.sdl3.o)
+OBJ = $(NO_SDL_SRC:.c=.o) $(CORE_CPP:.cpp=.o)
+SDL3_OBJ = $(SDL3_SRC:.c=.sdl3.o) $(CORE_CPP:.cpp=.sdl3.o)
 SDL12_C_OBJ = $(SDL12_C_SRC:.c=.sdl12.o)
 SDL12_CPP_OBJ = $(SDL12_CPP_SRC:.cpp=.sdl12.o)
 BIN = cv1k_sandbox
@@ -42,19 +43,26 @@ SDL12_BIN = cv1k_sandbox_sdl12
 
 all: $(BIN)
 
+# Final link uses the C++ driver because the SH-3 core is C++.
 $(BIN): $(OBJ)
-	$(CC) $(CFLAGS) -o $@ $(OBJ) $(LDFLAGS) $(ZLIB_LIBS)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJ) $(LDFLAGS) $(ZLIB_LIBS)
 
 .c.o:
 	$(CC) $(CFLAGS) $(ZLIB_CFLAGS) -DCV1K_WITH_ZLIB -Isrc -c $< -o $@
 
+src/sh3_core.o: src/sh3_core.cpp
+	$(CXX) $(CXXFLAGS) $(ZLIB_CFLAGS) -DCV1K_WITH_ZLIB -Isrc -c $< -o $@
+
 %.sdl3.o: %.c
 	$(CC) $(CFLAGS) $(ZLIB_CFLAGS) $(SDL3_CFLAGS) -DCV1K_WITH_ZLIB -DCV1K_WITH_SDL3 -Isrc -c $< -o $@
+
+%.sdl3.o: %.cpp
+	$(CXX) $(CXXFLAGS) $(ZLIB_CFLAGS) $(SDL3_CFLAGS) -DCV1K_WITH_ZLIB -DCV1K_WITH_SDL3 -Isrc -c $< -o $@
 
 sdl3: $(SDL3_BIN)
 
 $(SDL3_BIN): $(SDL3_OBJ)
-	$(CC) $(CFLAGS) -o $@ $(SDL3_OBJ) $(LDFLAGS) $(ZLIB_LIBS) $(SDL3_LIBS)
+	$(CXX) $(CXXFLAGS) -o $@ $(SDL3_OBJ) $(LDFLAGS) $(ZLIB_LIBS) $(SDL3_LIBS)
 
 %.sdl12.o: %.c
 	$(CC) $(CFLAGS) $(ZLIB_CFLAGS) $(SDL12_CFLAGS) -DCV1K_WITH_ZLIB -DCV1K_WITH_SDL12 -DCV1K_DEFAULT_SDL12 -Isrc -c $< -o $@

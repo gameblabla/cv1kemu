@@ -216,3 +216,9 @@ The current title/attract-screen path adds three MAME-aligned fixes and one loca
 - The DDPSDOJ auto-blit handoff is original sandbox glue. It reads the game's own command-list base/end pointers from RAM, validates that the list is inside CV1000 work RAM and begins with a recognized CV1000 command opcode, then runs the existing MAME-derived blitter parser bounded by the game's current list end. This bridges a missed MMIO launch in the partial SH7709S/IRQ/cache model; it is not copied MAME code and should be removed once the underlying CPU/platform model is complete.
 
 Relevant MAME source files remain BSD-3-Clause. `cv1k_v.cpp` and `cv1k_v.h` name David Haywood, Luca Elia, and MetalliC; `cv1k_v_pixel.ipp` names David Haywood.
+
+## v52 SDL 1.2 / YMZ770 audio note
+
+v52 adds an SDL 1.2 frontend and a MAME-derived YMZ770C audio output path.  The frontend itself (`src/ui_sdl12.c`) is original sandbox code using SDL 1.2 video, joystick/keyboard input, and an audio ring buffer.
+
+The stereo YMZ770 mixer in `src/ymz770_mame_audio.cpp` follows MAME `src/devices/sound/ymz770.cpp` for phrase offsets, sequence offsets, sequencer wait/end commands, channel key-on/key-off, loop handling, pan/volume scaling, main volume, and clip limiting.  The AMM/MPEG frame decoder in `src/mame_mpeg_audio.cpp` and `src/mame_mpeg_audio.h` is a standalone copy/adaptation of MAME `src/devices/sound/mpeg_audio.cpp` and `src/devices/sound/mpeg_audio.h` with the class renamed and MAME framework dependencies removed.  These files remain BSD-3-Clause-derived material; MAME names Olivier Galibert, R. Belmont, and MetalliC for the relevant YMZ770/MPEG audio files.

@@ -247,13 +247,16 @@ int main(int argc, char **argv)
     probe_requested = 0;
     trace_steps = 0;
     trace_fetch = 0;
-    irq2_enabled = 0;
+    /* The MAME-derived SH-3 core needs the real vblank IRQ2 and benefits from
+     * the idle-loop skip, so both are on by default now (a proper emulator,
+     * not a debug timeslice).  Use --no-irq2 to override for diagnostics. */
+    irq2_enabled = 1;
     aggressive_assists = 0;
     dcache_requested = 0;
     strict_cache_ops = 0;
     mame_cache_meta = 0;
     mame_trapa = 0;
-    mame_speedup = 0;
+    mame_speedup = 1;
     mame_full_dmatcr = 0;
     mame_tmu_irq = 0;
     wide_p0_alias = 0;
@@ -355,6 +358,10 @@ int main(int argc, char **argv)
             run_frames = atoi(argv[i]);
         } else if (strcmp(argv[i], "--irq2") == 0) {
             irq2_enabled = 1;
+        } else if (strcmp(argv[i], "--no-irq2") == 0) {
+            irq2_enabled = 0;
+        } else if (strcmp(argv[i], "--no-speedup") == 0) {
+            mame_speedup = 0;
         } else if (strcmp(argv[i], "--aggressive-assists") == 0) {
             aggressive_assists = 1;
         } else if (strcmp(argv[i], "--dcache") == 0) {
