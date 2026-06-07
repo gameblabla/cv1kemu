@@ -5,6 +5,8 @@
 #include "ui_sdl12.h"
 #include "savestate.h"
 #include "romset.h"
+#include "sh3_jit/cv1k_sh3_c23_jit.h"
+#include "threaded_runtime.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -33,6 +35,22 @@ static void usage(void)
     printf("  --tap-input name,start,frames  press an input during headless run\n");
     printf("  --hold-input name     hold an input during the whole headless run\n");
     printf("  --run-frames n        run without interactive UI\n");
+    printf("  --cpu-backend interp|c23-x64  choose SH3 execution backend; interpreter remains the default/fallback\n");
+    printf("  --c23-jit            alias for --cpu-backend c23-x64\n");
+    printf("  --rotate auto|none|cw|ccw|180  frontend/display orientation; auto uses cw for akatana and ccw otherwise\n");
+    printf("  --video-renderer software|gles2  SDL3 video path, default software\n");
+    printf("  --gles2-renderer    alias for --video-renderer gles2\n");
+    printf("  --gles2-tile-cache  use tiled VRAM texture/FBO cache in SDL3 GLES2 path, default\n");
+    printf("  --gles2-full-frame-upload  diagnostic: disable GLES2 tile cache and upload full frame\n");
+    printf("  --gles2-gpu-blitter  mirror supported CV1000 upload/draw commands into GLES2 tile FBOs\n");
+    printf("  --gles2-software-blitter  keep GLES2 as presentation-only tile cache, default\n");
+    printf("  --dump-display-ppm file  dump the frontend-oriented screen instead of raw 320x240\n");
+    printf("  --threads            enable optional worker threads for video render conversion and audio mixing\n");
+    printf("  --threaded-render    enable only threaded video-frame conversion when possible\n");
+    printf("  --threaded-audio     enable only threaded frontend/headless audio mixing when possible\n");
+    printf("  --no-threads         force the original single-threaded execution path\n");
+    printf("  --headless-present-check  read/hash the produced screen every headless frame, approximating SDL texture upload pressure\n");
+    printf("  --profile-sh3-only    profiling-only: skip per-frame screen conversion in headless/SDL-neutral machine_frame\n");
     printf("  --trace-steps n       print CPU PC/opcode/register trace, then exit if no run-frames\n");
     printf("  --trace-fetch         trace cached fetch opcode as well as raw RAM opcode\n");
     printf("  --aggressive-assists  enable risky DDPSDOJ boot shims past documented blockers\n");
@@ -242,6 +260,15 @@ int main(int argc, char **argv)
     int dma_cache_sync;
     int vblank_irq_and_tick;
     int nand_scan;
+    int headless_present_check;
+    int profile_sh3_only;
+    int c23_jit_requested;
+    int display_rotation_requested;
+    int video_renderer_requested;
+    int gles2_tile_cache_requested;
+    int gles2_gpu_blitter_requested;
+    int threaded_render_requested;
+    int threaded_audio_requested;
     const char *dump_ram;
     const char *dump_nand;
     const char *dump_eeprom;
@@ -256,6 +283,7 @@ int main(int argc, char **argv)
     const char *load_state;
     const char *dump_ppm;
     const char *dump_audio;
+    const char *dump_display_ppm;
     struct input_script_event input_script[MAX_INPUT_SCRIPT_EVENTS];
     int input_script_count;
     cv1k_u32 blit_addr;
@@ -297,6 +325,15 @@ int main(int argc, char **argv)
     dma_cache_sync = 0;
     vblank_irq_and_tick = 0;
     nand_scan = 0;
+    headless_present_check = 0;
+    profile_sh3_only = 0;
+    c23_jit_requested = 0;
+    display_rotation_requested = CV1K_DISPLAY_ROT_AUTO;
+    video_renderer_requested = CV1K_VIDEO_RENDERER_SOFTWARE;
+    gles2_tile_cache_requested = 1;
+    gles2_gpu_blitter_requested = 0;
+    threaded_render_requested = 0;
+    threaded_audio_requested = 0;
     dump_ram = NULL;
     dump_nand = NULL;
     dump_eeprom = NULL;
@@ -311,6 +348,7 @@ int main(int argc, char **argv)
     load_state = NULL;
     dump_ppm = NULL;
     dump_audio = NULL;
+    dump_display_ppm = NULL;
     input_script_count = 0;
     blit_addr = 0UL;
     blit_requested = 0;
@@ -430,6 +468,50 @@ int main(int argc, char **argv)
             vblank_irq_and_tick = 1;
         } else if (strcmp(argv[i], "--nand-scan") == 0) {
             nand_scan = 1;
+        } else if (strcmp(argv[i], "--headless-present-check") == 0) {
+            headless_present_check = 1;
+        } else if (strcmp(argv[i], "--cpu-backend") == 0 && i + 1 < argc) {
+            i++;
+            if (strcmp(argv[i], "c23-x64") == 0 || strcmp(argv[i], "c23jit") == 0 || strcmp(argv[i], "x64") == 0) c23_jit_requested = 1;
+            else if (strcmp(argv[i], "interp") == 0 || strcmp(argv[i], "interpreter") == 0) c23_jit_requested = 0;
+            else { fprintf(stderr, "unknown cpu backend: %s\n", argv[i]); return 1; }
+        } else if (strcmp(argv[i], "--c23-jit") == 0) {
+            c23_jit_requested = 1;
+        } else if (strcmp(argv[i], "--rotate") == 0 && i + 1 < argc) {
+            i++;
+            if (!cv1k_video_display_rotation_parse(argv[i], &display_rotation_requested)) {
+                fprintf(stderr, "unknown display rotation: %s\n", argv[i]);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--video-renderer") == 0 && i + 1 < argc) {
+            i++;
+            if (strcmp(argv[i], "software") == 0 || strcmp(argv[i], "sw") == 0) video_renderer_requested = CV1K_VIDEO_RENDERER_SOFTWARE;
+            else if (strcmp(argv[i], "gles2") == 0 || strcmp(argv[i], "opengles2") == 0 || strcmp(argv[i], "gles") == 0) video_renderer_requested = CV1K_VIDEO_RENDERER_GLES2;
+            else { fprintf(stderr, "unknown video renderer: %s\n", argv[i]); return 1; }
+        } else if (strcmp(argv[i], "--gles2-renderer") == 0 || strcmp(argv[i], "--gles2") == 0) {
+            video_renderer_requested = CV1K_VIDEO_RENDERER_GLES2;
+        } else if (strcmp(argv[i], "--gles2-tile-cache") == 0 || strcmp(argv[i], "--gles2-tiles") == 0) {
+            gles2_tile_cache_requested = 1;
+        } else if (strcmp(argv[i], "--gles2-full-frame-upload") == 0 || strcmp(argv[i], "--gles2-no-tiles") == 0) {
+            gles2_tile_cache_requested = 0;
+        } else if (strcmp(argv[i], "--gles2-gpu-blitter") == 0 || strcmp(argv[i], "--gles2-blitter") == 0) {
+            video_renderer_requested = CV1K_VIDEO_RENDERER_GLES2;
+            gles2_tile_cache_requested = 1;
+            gles2_gpu_blitter_requested = 1;
+        } else if (strcmp(argv[i], "--gles2-software-blitter") == 0 || strcmp(argv[i], "--gles2-no-gpu-blitter") == 0) {
+            gles2_gpu_blitter_requested = 0;
+        } else if (strcmp(argv[i], "--threads") == 0 || strcmp(argv[i], "--mt") == 0) {
+            threaded_render_requested = 1;
+            threaded_audio_requested = 1;
+        } else if (strcmp(argv[i], "--threaded-render") == 0) {
+            threaded_render_requested = 1;
+        } else if (strcmp(argv[i], "--threaded-audio") == 0) {
+            threaded_audio_requested = 1;
+        } else if (strcmp(argv[i], "--no-threads") == 0) {
+            threaded_render_requested = 0;
+            threaded_audio_requested = 0;
+        } else if (strcmp(argv[i], "--profile-sh3-only") == 0 || strcmp(argv[i], "--no-screen-render") == 0) {
+            profile_sh3_only = 1;
         } else if (strcmp(argv[i], "--dump-ram") == 0 && i + 1 < argc) {
             i++;
             dump_ram = argv[i];
@@ -470,12 +552,32 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "--dump-ppm") == 0 && i + 1 < argc) {
             i++;
             dump_ppm = argv[i];
+        } else if (strcmp(argv[i], "--dump-display-ppm") == 0 && i + 1 < argc) {
+            i++;
+            dump_display_ppm = argv[i];
         } else if (strcmp(argv[i], "--blit") == 0 && i + 1 < argc) {
             i++;
             blit_addr = parse_u32_arg(argv[i]);
             blit_requested = 1;
         }
     }
+
+    if (c23_jit_requested) {
+        if (!sh7709s_c23jit_available()) {
+            fprintf(stderr, "C23 SH-3 JIT requested but this build/host does not support it; using interpreter\n");
+        } else {
+            sh7709s_c23jit_enable(1);
+        }
+    }
+
+    if (display_rotation_requested == CV1K_DISPLAY_ROT_AUTO) {
+        m.display_rotation = have_report ? cv1k_video_display_rotation_auto_for_path(rr.source_path) : CV1K_DISPLAY_ROT_CCW;
+    } else {
+        m.display_rotation = display_rotation_requested;
+    }
+    m.video_renderer = video_renderer_requested;
+    m.gles2_tile_cache = gles2_tile_cache_requested;
+    m.gles2_gpu_blitter = gles2_gpu_blitter_requested;
 
     m.irq2_enabled = irq2_enabled;
     m.aggressive_boot_assists = aggressive_assists;
@@ -486,6 +588,14 @@ int main(int argc, char **argv)
     m.mame_speedup = mame_speedup;
     m.mame_full_dmatcr = mame_full_dmatcr;
     m.mame_tmu_irq = mame_tmu_irq;
+    m.render_screen = profile_sh3_only ? 0 : 1;
+    if ((threaded_render_requested || threaded_audio_requested) && !cv1k_mt_supported()) {
+        fprintf(stderr, "warning: threading was requested, but this build was made with THREADS=0; using single-threaded path\n");
+        threaded_render_requested = 0;
+        threaded_audio_requested = 0;
+    }
+    m.threaded_render = threaded_render_requested && m.render_screen;
+    m.threaded_audio = threaded_audio_requested;
     m.wide_p0_alias = wide_p0_alias;
     m.compact_400_alias = compact_400_alias;
     m.dma_cache_sync = dma_cache_sync;
@@ -518,6 +628,14 @@ int main(int argc, char **argv)
         m.mame_speedup = mame_speedup;
         m.mame_full_dmatcr = mame_full_dmatcr;
         m.mame_tmu_irq = mame_tmu_irq;
+        m.render_screen = profile_sh3_only ? 0 : 1;
+        m.threaded_render = threaded_render_requested && m.render_screen;
+        m.threaded_audio = threaded_audio_requested;
+        if (display_rotation_requested == CV1K_DISPLAY_ROT_AUTO) m.display_rotation = have_report ? cv1k_video_display_rotation_auto_for_path(rr.source_path) : CV1K_DISPLAY_ROT_CCW;
+        else m.display_rotation = display_rotation_requested;
+        m.video_renderer = video_renderer_requested;
+        m.gles2_tile_cache = gles2_tile_cache_requested;
+        m.gles2_gpu_blitter = gles2_gpu_blitter_requested;
         m.wide_p0_alias = wide_p0_alias;
         m.compact_400_alias = compact_400_alias;
         m.dma_cache_sync = dma_cache_sync;
@@ -585,25 +703,80 @@ int main(int argc, char **argv)
         FILE *af = NULL;
         cv1k_u32 a_accum = 0UL;
         cv1k_u32 a_total = 0UL;
+        cv1k_u32 present_hash = 0UL;
+        struct cv1k_mt_render *mt_render = NULL;
+        struct cv1k_mt_audio *mt_audio = NULL;
+        int mt_render_active = 0;
+        int mt_audio_active = 0;
+        int render_pending = 0;
+        if (m.threaded_render && !profile_sh3_only) {
+            mt_render = cv1k_mt_render_create();
+            mt_render_active = (mt_render != NULL);
+            if (!mt_render_active) fprintf(stderr, "warning: threaded render worker unavailable; using single-threaded render path\n");
+        }
         if (dump_audio != NULL) {
             af = fopen(dump_audio, "wb");
             if (af != NULL) write_wav_header(af, CV1K_YMZ770_CLOCK_HZ / 1024UL, 2UL, 0UL);
+            if (af != NULL && m.threaded_audio) {
+                mt_audio = cv1k_mt_audio_create(2048UL);
+                mt_audio_active = (mt_audio != NULL);
+                if (!mt_audio_active) fprintf(stderr, "warning: threaded audio worker unavailable; using single-threaded audio mix path\n");
+            }
         }
         for (i = 0; i < run_frames; i++) {
             apply_input_script(&m.input, input_script, input_script_count, i);
-            cv1k_machine_frame(&m);
+            cv1k_machine_frame_advance(&m, mt_render_active ? 0 : m.render_screen);
+            if (mt_render_active) {
+                if (cv1k_mt_render_submit(mt_render, &m.video)) {
+                    render_pending = 1;
+                    m.threaded_render_jobs++;
+                } else {
+                    cv1k_video_frame(&m.video, m.main_ram, m.main_ram_size);
+                    render_pending = 0;
+                }
+            }
             if (af != NULL) {
                 short abuf[2048];
                 cv1k_u32 n;
+                int audio_pending = 0;
                 a_accum += (CV1K_YMZ770_CLOCK_HZ / 1024UL) * 1000UL;
                 n = a_accum / CV1K_REFRESH_MILLIHZ;
                 a_accum -= n * CV1K_REFRESH_MILLIHZ;
                 if (n > 1024UL) n = 1024UL;
-                cv1k_ymz770_mix_s16_stereo(&m.ymz, m.sound_rom, m.sound_rom_size, abuf, n);
-                fwrite(abuf, sizeof(short) * 2U, n, af);
-                a_total += n;
+                if (mt_audio_active && cv1k_mt_audio_submit(mt_audio, &m.ymz, m.sound_rom, m.sound_rom_size, n)) {
+                    audio_pending = 1;
+                    m.threaded_audio_jobs++;
+                } else {
+                    cv1k_ymz770_mix_s16_stereo(&m.ymz, m.sound_rom, m.sound_rom_size, abuf, n);
+                    fwrite(abuf, sizeof(short) * 2U, n, af);
+                    a_total += n;
+                }
+                if (headless_present_check && !profile_sh3_only) {
+                    if (render_pending) {
+                        cv1k_mt_render_wait(mt_render, &m.video);
+                        render_pending = 0;
+                    }
+                    present_hash = (present_hash * 33UL) ^ cv1k_video_present_checksum(&m.video);
+                }
+                if (audio_pending) {
+                    const short *pcm = NULL;
+                    cv1k_u32 got = 0UL;
+                    if (cv1k_mt_audio_wait(mt_audio, &pcm, &got) && pcm != NULL) {
+                        fwrite(pcm, sizeof(short) * 2U, got, af);
+                        a_total += got;
+                    }
+                }
+            } else if (headless_present_check && !profile_sh3_only) {
+                if (render_pending) {
+                    cv1k_mt_render_wait(mt_render, &m.video);
+                    render_pending = 0;
+                }
+                present_hash = (present_hash * 33UL) ^ cv1k_video_present_checksum(&m.video);
             }
         }
+        if (render_pending) cv1k_mt_render_wait(mt_render, &m.video);
+        cv1k_mt_audio_destroy(mt_audio);
+        cv1k_mt_render_destroy(mt_render);
         if (af != NULL) {
             fseek(af, 0L, SEEK_SET);
             write_wav_header(af, CV1K_YMZ770_CLOCK_HZ / 1024UL, 2UL, a_total);
@@ -615,6 +788,7 @@ int main(int argc, char **argv)
         }
         cv1k_machine_status(&m, status, (cv1k_u32)sizeof(status));
         printf("%s\n", status);
+        if (headless_present_check) printf("headless_present_checksum=%08lx\n", (unsigned long)present_hash);
         if (have_report) {
             cv1k_romset_report_text(&rr, status, (cv1k_u32)sizeof(status));
             printf("%s", status);
@@ -626,6 +800,11 @@ int main(int argc, char **argv)
     if (dump_ppm != NULL) {
         cv1k_video_frame(&m.video, m.main_ram, m.main_ram_size);
         if (!cv1k_video_write_ppm(&m.video, dump_ppm)) fprintf(stderr, "warning: PPM dump failed: %s\n", dump_ppm);
+    }
+
+    if (dump_display_ppm != NULL) {
+        cv1k_video_frame(&m.video, m.main_ram, m.main_ram_size);
+        if (!cv1k_video_write_display_ppm(&m.video, m.display_rotation, dump_display_ppm)) fprintf(stderr, "warning: display PPM dump failed: %s\n", dump_display_ppm);
     }
 
     if (dump_ram != NULL) {
@@ -660,6 +839,12 @@ int main(int argc, char **argv)
         if (!cv1k_save_state(&m, save_state)) fprintf(stderr, "warning: state save failed: %s\n", save_state);
     }
 
+    if (c23_jit_requested) {
+        cv1k_u32 db, dh, df, di;
+        sh7709s_c23jit_stats(&db, &dh, &df, &di);
+        fprintf(stderr, "c23-sh3-jit: blocks=%lu hits=%lu fallbacks=%lu invalidations=%lu\n",
+            (unsigned long)db, (unsigned long)dh, (unsigned long)df, (unsigned long)di);
+    }
     cv1k_machine_shutdown(&m);
     return 0;
 }

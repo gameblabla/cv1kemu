@@ -19,6 +19,7 @@ extern "C" {
 #include "cpu_sh7709s.h"
 #include "bus.h"
 #include "emu.h"
+#include "sh3_jit/cv1k_sh3_c23_jit.h"
 }
 
 #include <stdint.h>
@@ -79,7 +80,7 @@ public:
      * per-byte decode + icache/dcache timing simulation (which the accurate
      * MAME core does not need).  Everything else (NAND, blitter MMIO, SH I/O,
      * TLB-aliased windows) falls back to the full cv1k bus path. */
-    cv1k_u8 *hot_ptr(uint32_t addr, int is_write, uint32_t need)
+    CV1K_ALWAYS_INLINE cv1k_u8 *hot_ptr(uint32_t addr, int is_write, uint32_t need)
     {
         struct cv1k_machine *mm = bus->machine;
         uint32_t phys = (addr >= 0x80000000U && addr <= 0xbfffffffU) ? (addr & 0x1fffffffU) : addr;
@@ -93,19 +94,19 @@ public:
         return 0;
     }
 
-    uint8_t  read_byte(uint32_t a)
+    CV1K_ALWAYS_INLINE uint8_t  read_byte(uint32_t a)
     { cv1k_u8 *p = hot_ptr(a, 0, 1); return p ? *p : cv1k_bus_read8(bus, a); }
-    uint16_t read_word(uint32_t a)
+    CV1K_ALWAYS_INLINE uint16_t read_word(uint32_t a)
     { cv1k_u8 *p = hot_ptr(a, 0, 2); return p ? (uint16_t)(((uint16_t)p[0] << 8) | p[1]) : cv1k_bus_read16(bus, a); }
-    uint32_t read_long(uint32_t a)
+    CV1K_ALWAYS_INLINE uint32_t read_long(uint32_t a)
     { cv1k_u8 *p = hot_ptr(a, 0, 4); return p ? (((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]) : cv1k_bus_read32(bus, a); }
-    void     write_byte(uint32_t a, uint8_t d)
+    CV1K_ALWAYS_INLINE void     write_byte(uint32_t a, uint8_t d)
     { cv1k_u8 *p = hot_ptr(a, 1, 1); if (p) *p = d; else cv1k_bus_write8(bus, a, d); }
-    void     write_word(uint32_t a, uint16_t d)
+    CV1K_ALWAYS_INLINE void     write_word(uint32_t a, uint16_t d)
     { cv1k_u8 *p = hot_ptr(a, 1, 2); if (p) { p[0] = (cv1k_u8)(d >> 8); p[1] = (cv1k_u8)d; } else cv1k_bus_write16(bus, a, d); }
-    void     write_long(uint32_t a, uint32_t d)
+    CV1K_ALWAYS_INLINE void     write_long(uint32_t a, uint32_t d)
     { cv1k_u8 *p = hot_ptr(a, 1, 4); if (p) { p[0] = (cv1k_u8)(d >> 24); p[1] = (cv1k_u8)(d >> 16); p[2] = (cv1k_u8)(d >> 8); p[3] = (cv1k_u8)d; } else cv1k_bus_write32(bus, a, d); }
-    uint16_t fetch_word(uint32_t a)
+    CV1K_ALWAYS_INLINE uint16_t fetch_word(uint32_t a)
     { cv1k_u8 *p = hot_ptr(a, 0, 2); return p ? (uint16_t)(((uint16_t)p[0] << 8) | p[1]) : cv1k_bus_fetch16(bus, a); }
 
     /* ---- shared SH-2/3/4 interpreter (verbatim from MAME sh.cpp) ---- */
@@ -350,17 +351,20 @@ public:
      * External IRL lines (event 0x600..0x6ff) are hold-line and cleared on
      * acceptance; internal peripherals (TMU, event 0x400..0x4ff) stay asserted
      * until the handler clears them via the peripheral register. */
-    bool check_pending_irq()
+    CV1K_ALWAYS_INLINE bool check_pending_irq()
     {
-        if ((st->sr & BL) != 0UL) return false;
+        if (CV1K_LIKELY(st->pend_mask == 0U)) return false;
+        if (CV1K_UNLIKELY((st->sr & BL) != 0UL)) return false;
         uint32_t mask = (st->sr >> 4) & 0x0fUL;
+        uint32_t pm = st->pend_mask;
         int best = -1;
         uint32_t best_pri = 0UL;
-        for (int i = 0; i < 8; i++) {
-            if (st->pend_event[i] == 0UL) continue;
+        while (pm != 0U) {
+            uint32_t bit = pm & (0U - pm);
+            int i = __builtin_ctz(pm);
             uint32_t pri = st->pend_pri[i] & 0x0fUL;
-            if (pri == 0UL || pri <= mask) continue;
-            if (pri > best_pri) { best_pri = pri; best = i; }
+            if (pri > mask && pri > best_pri) { best_pri = pri; best = i; }
+            pm ^= bit;
         }
         if (best < 0) return false;
 
@@ -379,6 +383,7 @@ public:
         if (event >= 0x600UL && event < 0x700UL) {
             st->pend_event[best] = 0UL;   /* external hold-line: cleared on ack */
             st->pend_pri[best] = 0UL;
+            st->pend_mask &= ~(1U << best);
         }
         st->irq_ack_count++;
         st->exception_count++;
@@ -386,7 +391,7 @@ public:
     }
 
     /* ---- single instruction step (MAME sh34_base_device::execute_run body) ---- */
-    int step()
+    CV1K_ALWAYS_INLINE int step()
     {
         if (st->sleep_mode == 1UL) {
             /* power-down: only an interrupt can wake the core */
@@ -422,6 +427,7 @@ public:
 
 extern "C" void sh7709s_reset(struct sh7709s_cpu *cpu)
 {
+    sh7709s_c23jit_reset();
     memset(cpu, 0, sizeof(*cpu));
     cpu->pc = 0xa0000000UL;       /* SH-3 reset vector (P2 boot area) */
     cpu->sr = 0x700000f0UL;       /* MD|RB|BL, IMASK=15 */
@@ -433,10 +439,10 @@ static void irq_assert(struct sh7709s_cpu *cpu, cv1k_u32 event, cv1k_u32 pri)
     int i;
     if (cpu == NULL || event == 0UL) return;
     for (i = 0; i < 8; i++) {
-        if (cpu->pend_event[i] == event) { cpu->pend_pri[i] = pri; return; }
+        if (cpu->pend_event[i] == event) { cpu->pend_pri[i] = pri; cpu->pend_mask |= (1U << i); return; }
         if (empty < 0 && cpu->pend_event[i] == 0UL) empty = i;
     }
-    if (empty >= 0) { cpu->pend_event[empty] = event; cpu->pend_pri[empty] = pri; }
+    if (empty >= 0) { cpu->pend_event[empty] = event; cpu->pend_pri[empty] = pri; cpu->pend_mask |= (1U << empty); }
 }
 
 extern "C" void sh7709s_request_irq(struct sh7709s_cpu *cpu, int level)
@@ -459,8 +465,53 @@ extern "C" void sh7709s_clear_irq_event(struct sh7709s_cpu *cpu, cv1k_u32 event)
     int i;
     if (cpu == NULL) return;
     for (i = 0; i < 8; i++) {
-        if (cpu->pend_event[i] == event) { cpu->pend_event[i] = 0UL; cpu->pend_pri[i] = 0UL; }
+        if (cpu->pend_event[i] == event) { cpu->pend_event[i] = 0UL; cpu->pend_pri[i] = 0UL; cpu->pend_mask &= ~(1U << i); }
     }
+}
+
+extern "C" int sh7709s_accept_pending_irq(struct sh7709s_cpu *cpu, struct cv1k_bus *bus)
+{
+    if (cpu == NULL || bus == NULL) return 0;
+    if (cpu->pend_mask == 0U) return 0;
+    if ((cpu->sr & BL) != 0U) return 0;
+    uint32_t mask = (cpu->sr & SH_I) >> 4;
+    uint32_t pm = cpu->pend_mask;
+    int best = -1;
+    uint32_t best_pri = 0U;
+    while (pm != 0U) {
+        uint32_t bit = pm & (0U - pm);
+        int i = __builtin_ctz(pm);
+        uint32_t pri = cpu->pend_pri[i] & 0x0fU;
+        if (pri > mask && pri > best_pri) { best_pri = pri; best = i; }
+        pm ^= bit;
+    }
+    if (best < 0) return 0;
+
+    uint32_t event = cpu->pend_event[best];
+    cv1k_bus_irq_ack(bus, best_pri, event);
+    cpu->spc = cpu->pc;
+    cpu->ssr = cpu->sr;
+    cpu->sgr = cpu->r[15];
+    cpu->sr |= MD;
+    if (!(cpu->sr & sRB)) {
+        for (int i = 0; i < 8; i++) {
+            uint32_t t = cpu->r[i];
+            cpu->r[i] = cpu->rb[i];
+            cpu->rb[i] = t;
+        }
+    }
+    cpu->sr |= sRB;
+    cpu->sr |= BL;
+    cpu->pc = cpu->vbr + 0x600U;
+    if (cpu->sleep_mode == 1U) cpu->sleep_mode = 2U;
+    if (event >= 0x600U && event < 0x700U) {
+        cpu->pend_event[best] = 0U;
+        cpu->pend_pri[best] = 0U;
+        cpu->pend_mask &= ~(1U << best);
+    }
+    cpu->irq_ack_count++;
+    cpu->exception_count++;
+    return 1;
 }
 
 extern "C" int sh7709s_step(struct sh7709s_cpu *cpu, struct cv1k_bus *bus)
@@ -476,7 +527,7 @@ extern "C" int sh7709s_step(struct sh7709s_cpu *cpu, struct cv1k_bus *bus)
  * the given idle PCs (the per-frame vblank-wait spin).  Runs the whole frame
  * inside one call so per-instruction C-ABI / object-construction overhead is
  * paid once per frame instead of once per instruction. */
-extern "C" cv1k_u32 sh7709s_run_until_idle(struct sh7709s_cpu *cpu, struct cv1k_bus *bus,
+extern "C" CV1K_HOT cv1k_u32 sh7709s_run_until_idle(struct sh7709s_cpu *cpu, struct cv1k_bus *bus,
                                            cv1k_u32 cycle_budget, cv1k_u32 idle_pc0, cv1k_u32 idle_pc1)
 {
     sh34_cpu c;
@@ -502,7 +553,17 @@ extern "C" cv1k_u32 sh7709s_run_until_idle(struct sh7709s_cpu *cpu, struct cv1k_
  * the next TMU boundary instead of interpreting ~1.7M spin instructions.  Each
  * TMU underflow still posts its interrupt and the timer ISR still runs, so the
  * sound engine advances at full rate while idle spin costs almost nothing. */
-extern "C" cv1k_u32 sh7709s_run_frame(struct sh7709s_cpu *cpu, struct cv1k_bus *bus,
+extern "C" CV1K_HOT cv1k_u32 sh7709s_run_frame(struct sh7709s_cpu *cpu, struct cv1k_bus *bus,
+                                      cv1k_u32 cycle_budget, cv1k_u32 tmu_interval)
+{
+    if (sh7709s_c23jit_enabled()) {
+        cv1k_u32 ran = sh7709s_c23jit_run_frame(cpu, bus, cycle_budget, tmu_interval);
+        if (ran != 0UL) return ran;
+    }
+    return sh7709s_run_frame_interpreter(cpu, bus, cycle_budget, tmu_interval);
+}
+
+extern "C" CV1K_HOT cv1k_u32 sh7709s_run_frame_interpreter(struct sh7709s_cpu *cpu, struct cv1k_bus *bus,
                                       cv1k_u32 cycle_budget, cv1k_u32 tmu_interval)
 {
     sh34_cpu c;

@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdint.h>
 
 int cv1k_platform_check(void)
 {
@@ -15,10 +16,24 @@ int cv1k_platform_check(void)
 void *cv1k_xmalloc(cv1k_u32 size)
 {
     void *p;
-    p = malloc((size_t)size);
-    if (p != NULL) {
-        memset(p, 0, (size_t)size);
+    size_t n;
+    n = (size_t)size;
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
+    {
+        size_t align;
+        size_t padded;
+        align = (size_t)CV1K_CACHE_ALIGN;
+        padded = (n + align - 1U) & ~(align - 1U);
+        if (padded < n) return NULL;
+        p = aligned_alloc(align, padded);
+        if (p != NULL) {
+            memset(p, 0, padded);
+            return p;
+        }
     }
+#endif
+    p = malloc(n);
+    if (p != NULL) memset(p, 0, n);
     return p;
 }
 

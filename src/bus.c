@@ -18,6 +18,7 @@
 #include "bus.h"
 #include "emu.h"
 #include "platform.h"
+#include "sh3_jit/cv1k_sh3_c23_jit.h"
 #include <stddef.h>
 #include <string.h>
 
@@ -86,12 +87,12 @@ int cv1k_bus_mame_trapa_enabled(struct cv1k_bus *bus)
     return m->mame_trapa ? 1 : 0;
 }
 
-static int in_range(cv1k_u32 addr, cv1k_u32 base, cv1k_u32 size)
+static CV1K_ALWAYS_INLINE int in_range(cv1k_u32 addr, cv1k_u32 base, cv1k_u32 size)
 {
     return addr >= base && addr < (base + size);
 }
 
-static int sh_addr_is_p2_uncached(cv1k_u32 addr)
+static CV1K_ALWAYS_INLINE int sh_addr_is_p2_uncached(cv1k_u32 addr)
 {
     return addr >= 0xa0000000UL && addr <= 0xbfffffffUL;
 }
@@ -107,7 +108,7 @@ static int cv1k_is_physical_device_window(cv1k_u32 addr)
     return 0;
 }
 
-static cv1k_u32 cpu_addr_translate(struct cv1k_machine *m, cv1k_u32 addr);
+static CV1K_HOT cv1k_u32 cpu_addr_translate(struct cv1k_machine *m, cv1k_u32 addr);
 static void mame_cache_meta_access(struct cv1k_machine *m, cv1k_u32 vaddr, cv1k_u32 phys, int write, int fetch);
 static void icache_invalidate_line(struct cv1k_machine *m, cv1k_u32 phys);
 static void dcache_invalidate_line_public(struct cv1k_machine *m, cv1k_u32 phys);
@@ -199,7 +200,7 @@ static cv1k_u32 tmu_priority_for_channel(struct cv1k_machine *m, int ch)
 static void dmac_complete_timers(struct cv1k_machine *m);
 static void dmac_schedule_completion(struct cv1k_machine *m, cv1k_u32 base, cv1k_u32 chcr, cv1k_u32 transfers);
 
-static void tmu_update_channel(struct cv1k_machine *m, int ch)
+static CV1K_HOT void tmu_update_channel(struct cv1k_machine *m, int ch)
 {
     static const cv1k_u32 divs[8] = { 4UL, 16UL, 64UL, 256UL, 1024UL, 1UL, 1UL, 1UL };
     cv1k_u8 tstr;
@@ -210,6 +211,7 @@ static void tmu_update_channel(struct cv1k_machine *m, int ch)
     cv1k_u32 div;
     cv1k_u32 tcnt;
     cv1k_u32 tcor;
+    cv1k_u32 underflows;
     cv1k_u16 tcr;
     cv1k_u32 event;
     cv1k_u32 pri;
@@ -227,25 +229,39 @@ static void tmu_update_channel(struct cv1k_machine *m, int ch)
     m->tmu_last_cycles[ch] = last + ticks * div;
     tcnt = shio_read_be32(m, tmu_tcnt_off(ch));
     tcor = shio_read_be32(m, tmu_tcor_off(ch));
-    while (ticks != 0UL) {
-        if (tcnt > ticks) { tcnt -= ticks; ticks = 0UL; }
-        else {
-            ticks -= (tcnt + 1UL);
-            tcnt = tcor;
-            tcr = (cv1k_u16)(tcr | 0x0100U);
-            shio_write_be16(m, tmu_tcr_off(ch), tcr);
-            m->tmu_underflows[ch]++;
-            event = tmu_event_for_channel(ch);
-            pri = tmu_priority_for_channel(m, ch);
-            m->tmu_last_event = event;
-            m->tmu_last_priority = pri;
-            if (m->mame_tmu_irq && (tcr & 0x0020U) != 0U && pri != 0UL) sh7709s_request_irq_event(&m->cpu, event, (int)pri);
+
+    underflows = 0UL;
+    if (tcnt >= ticks) {
+        tcnt -= ticks;
+    } else {
+        ticks -= (tcnt + 1UL);
+        underflows = 1UL;
+        if (tcor == 0xffffffffUL) {
+            tcnt = 0xffffffffUL - ticks;
+        } else {
+            cv1k_u32 period;
+            period = tcor + 1UL;
+            underflows += ticks / period;
+            ticks %= period;
+            tcnt = tcor - ticks;
         }
+        tcr = (cv1k_u16)(tcr | 0x0100U);
+        shio_write_be16(m, tmu_tcr_off(ch), tcr);
+        m->tmu_underflows[ch] += underflows;
+        event = tmu_event_for_channel(ch);
+        pri = tmu_priority_for_channel(m, ch);
+        m->tmu_last_event = event;
+        m->tmu_last_priority = pri;
+        /* The SH7709S underflow bit is level/sticky until software clears TCR.
+         * Collapsing batched underflows to one pending event is equivalent at
+         * the interrupt controller and avoids reposting the same event thousands
+         * of times while the CPU is catching up. */
+        if (m->mame_tmu_irq && (tcr & 0x0020U) != 0U && pri != 0UL) sh7709s_request_irq_event(&m->cpu, event, (int)pri);
     }
     shio_write_be32(m, tmu_tcnt_off(ch), tcnt);
 }
 
-void cv1k_bus_tmu_tick(struct cv1k_bus *bus)
+CV1K_HOT void cv1k_bus_tmu_tick(struct cv1k_bus *bus)
 {
     struct cv1k_machine *m;
     m = bus ? bus->machine : NULL;
@@ -254,6 +270,45 @@ void cv1k_bus_tmu_tick(struct cv1k_bus *bus)
     tmu_update_channel(m, 0);
     tmu_update_channel(m, 1);
     tmu_update_channel(m, 2);
+}
+
+CV1K_HOT cv1k_u32 cv1k_bus_cycles_until_event(struct cv1k_bus *bus)
+{
+    struct cv1k_machine *m;
+    cv1k_u32 best = 0xffffffffUL;
+    cv1k_u32 now;
+    cv1k_u32 mask;
+    int ch;
+    static const cv1k_u32 divs[8] = { 4UL, 16UL, 64UL, 256UL, 1024UL, 1UL, 1UL, 1UL };
+
+    m = bus ? bus->machine : NULL;
+    if (m == NULL) return best;
+    now = m->cpu.cycles;
+
+    mask = m->dma_timer_mask;
+    while (mask != 0UL) {
+        cv1k_u32 bit = mask & (0UL - mask);
+        cv1k_u32 dch = (cv1k_u32)__builtin_ctz(mask);
+        cv1k_u32 due = m->dma_timer_due[dch];
+        cv1k_u32 delta = ((cv1k_s32)(due - now) <= 0) ? 0UL : (due - now);
+        if (delta < best) best = delta;
+        mask ^= bit;
+    }
+
+    for (ch = 0; ch < 3; ch++) {
+        cv1k_u8 tstr = m->sh_io[0xfe92UL & (CV1K_REGION_SH_IO_SIZE - 1UL)];
+        cv1k_u16 tcr;
+        cv1k_u32 div;
+        cv1k_u32 tcnt;
+        cv1k_u32 delta;
+        if ((tstr & (1U << ch)) == 0U) continue;
+        tcr = shio_read_be16(m, tmu_tcr_off(ch));
+        div = divs[tcr & 7U];
+        tcnt = shio_read_be32(m, tmu_tcnt_off(ch));
+        delta = (tcnt == 0xffffffffUL) ? 0xffffffffUL : ((tcnt + 1UL) * div);
+        if (delta < best) best = delta;
+    }
+    return best;
 }
 
 static cv1k_u32 dmac_transfer_size_from_chcr(cv1k_u32 chcr)
@@ -305,22 +360,24 @@ static cv1k_u32 dmac_align_for_unit(cv1k_u32 addr, cv1k_u32 unit)
 
 static void dmac_complete_timers(struct cv1k_machine *m)
 {
-    cv1k_u32 ch;
+    cv1k_u32 mask;
     cv1k_u32 now;
-    cv1k_u32 base;
-    cv1k_u32 chcr;
     if (m == NULL) return;
+    mask = m->dma_timer_mask;
+    if (CV1K_LIKELY(mask == 0UL)) return;
     now = m->cpu.cycles;
-    for (ch = 0UL; ch < 4UL; ch++) {
-        if (m->dma_timer_active[ch] != 0UL) {
-            if ((cv1k_s32)(now - m->dma_timer_due[ch]) >= 0) {
-                base = m->dma_timer_base[ch];
-                chcr = m->dma_timer_chcr[ch];
-                shio_write_be32(m, base + 0x08UL, 0UL);
-                shio_write_be32(m, base + 0x0cUL, (chcr & ~1UL) | 2UL);
-                m->dma_timer_active[ch] = 0UL;
-            }
+    while (mask != 0UL) {
+        cv1k_u32 bit = mask & (0UL - mask);
+        cv1k_u32 ch = (cv1k_u32)__builtin_ctz(mask);
+        if ((cv1k_s32)(now - m->dma_timer_due[ch]) >= 0) {
+            cv1k_u32 base = m->dma_timer_base[ch];
+            cv1k_u32 chcr = m->dma_timer_chcr[ch];
+            shio_write_be32(m, base + 0x08UL, 0UL);
+            shio_write_be32(m, base + 0x0cUL, (chcr & ~1UL) | 2UL);
+            m->dma_timer_active[ch] = 0UL;
+            m->dma_timer_mask &= ~bit;
         }
+        mask ^= bit;
     }
 }
 
@@ -339,6 +396,7 @@ static void dmac_schedule_completion(struct cv1k_machine *m, cv1k_u32 base, cv1k
     delay = (transfers > 0x7fffffUL) ? 0x00ffffffUL : (transfers * 2UL + 1UL);
     if (delay < 2UL) delay = 2UL;
     m->dma_timer_active[ch] = 1UL;
+    m->dma_timer_mask |= (1UL << ch);
     m->dma_timer_due[ch] = m->cpu.cycles + delay;
     m->dma_timer_chcr[ch] = chcr;
     m->dma_timer_base[ch] = base;
@@ -397,7 +455,7 @@ static int dmac_try_fast_nand_data_to_ram(struct cv1k_machine *m, cv1k_u32 *sar,
     return 1;
 }
 
-static void maybe_sh_dma(struct cv1k_machine *m, cv1k_u32 off)
+static CV1K_HOT void maybe_sh_dma(struct cv1k_machine *m, cv1k_u32 off)
 {
     cv1k_u32 base;
     cv1k_u32 sar;
@@ -514,7 +572,7 @@ static void maybe_sh_dma(struct cv1k_machine *m, cv1k_u32 off)
     }
 }
 
-static cv1k_u8 sh_io_port_r(struct cv1k_machine *m, cv1k_u32 off)
+static CV1K_HOT cv1k_u8 sh_io_port_r(struct cv1k_machine *m, cv1k_u32 off)
 {
     int tmu_ch;
     dmac_complete_timers(m);
@@ -559,7 +617,7 @@ static cv1k_u8 sh_io_port_r(struct cv1k_machine *m, cv1k_u32 off)
     return m->sh_io[off & (CV1K_REGION_SH_IO_SIZE - 1UL)];
 }
 
-static void sh_io_port_w(struct cv1k_machine *m, cv1k_u32 off, cv1k_u8 data)
+static CV1K_HOT void sh_io_port_w(struct cv1k_machine *m, cv1k_u32 off, cv1k_u8 data)
 {
     int tmu_ch;
     dmac_complete_timers(m);
@@ -672,7 +730,7 @@ static cv1k_u32 tlb_page_size_from_ptel(cv1k_u32 ptel)
     }
 }
 
-static cv1k_u32 cpu_addr_translate(struct cv1k_machine *m, cv1k_u32 addr)
+static CV1K_HOT cv1k_u32 cpu_addr_translate(struct cv1k_machine *m, cv1k_u32 addr)
 {
     cv1k_u32 i;
     /* SH-3 area aliases used by the CV1000 boot ROM.
@@ -966,7 +1024,44 @@ static void cv1k_bus_dma_write8(struct cv1k_machine *m, cv1k_u32 addr, cv1k_u8 d
     m->last_unmapped_write_data = (cv1k_u32)data;
 }
 
-cv1k_u8 cv1k_bus_read8(struct cv1k_bus *bus, cv1k_u32 addr)
+
+static cv1k_u32 cv1k_bus_blitter_read32(struct cv1k_machine *m, cv1k_u32 phys)
+{
+    cv1k_u32 off;
+    if (m == NULL) return 0xffffffffUL;
+    off = phys - CV1K_ADDR_BLITTER;
+    if ((off & ~3UL) == 0x10UL) {
+        cv1k_machine_sync_video_busy(m);
+        if (m->mame_speedup && (m->video.busy || m->video.busy_cycles_left != 0UL)) {
+            cv1k_u32 pc;
+            pc = m->cpu.ppc;
+            if (pc == m->last_blitter_status_pc) m->blitter_status_spin_reads++;
+            else { m->last_blitter_status_pc = pc; m->blitter_status_spin_reads = 0UL; }
+            if (m->blitter_status_spin_reads != 0UL) cv1k_machine_fast_forward_blitter_busy(m);
+        } else {
+            m->last_blitter_status_pc = 0UL;
+            m->blitter_status_spin_reads = 0UL;
+        }
+    }
+    return cv1k_video_read32(&m->video, off);
+}
+
+static cv1k_u8 cv1k_bus_blitter_read8(struct cv1k_machine *m, cv1k_u32 phys)
+{
+    cv1k_u32 v;
+    cv1k_u32 off;
+    cv1k_u32 shift;
+    if (m == NULL) return 0xffU;
+    off = phys - CV1K_ADDR_BLITTER;
+    if ((off & ~3UL) == 0x10UL) {
+        v = cv1k_bus_blitter_read32(m, phys & ~3UL);
+        shift = (3UL - (off & 3UL)) * 8UL;
+        return (cv1k_u8)((v >> shift) & 0xffUL);
+    }
+    return cv1k_video_read8(&m->video, off);
+}
+
+CV1K_HOT cv1k_u8 cv1k_bus_read8(struct cv1k_bus *bus, cv1k_u32 addr)
 {
     struct cv1k_machine *m;
     cv1k_u32 off;
@@ -975,7 +1070,7 @@ cv1k_u8 cv1k_bus_read8(struct cv1k_bus *bus, cv1k_u32 addr)
     if (m == NULL) return 0xffU;
     original_addr = addr;
     addr = cpu_addr_translate(m, addr);
-    mame_cache_meta_access(m, original_addr, addr, 0, 0);
+    if (CV1K_UNLIKELY(m->mame_cache_meta)) mame_cache_meta_access(m, original_addr, addr, 0, 0);
 
     if (in_range(addr, CV1K_ADDR_SH_IO, CV1K_REGION_SH_IO_SIZE)) {
         return sh_io_port_r(m, addr - CV1K_ADDR_SH_IO);
@@ -1005,7 +1100,7 @@ cv1k_u8 cv1k_bus_read8(struct cv1k_bus *bus, cv1k_u32 addr)
     }
 
     if (in_range(addr, CV1K_ADDR_BLITTER, CV1K_REGION_BLITTER_SIZE)) {
-        return cv1k_video_read8(&m->video, addr - CV1K_ADDR_BLITTER);
+        return cv1k_bus_blitter_read8(m, addr);
     }
 
     if (in_range(addr, CV1K_ADDR_CACHE, m->cache_ram_size)) {
@@ -1017,7 +1112,7 @@ cv1k_u8 cv1k_bus_read8(struct cv1k_bus *bus, cv1k_u32 addr)
     return 0xffU;
 }
 
-cv1k_u16 cv1k_bus_read16(struct cv1k_bus *bus, cv1k_u32 addr)
+CV1K_HOT cv1k_u16 cv1k_bus_read16(struct cv1k_bus *bus, cv1k_u32 addr)
 {
     cv1k_u16 a;
     cv1k_u16 b;
@@ -1067,6 +1162,7 @@ static void icache_prefill_block(struct cv1k_machine *m, cv1k_u32 phys)
 
 static void icache_invalidate_line(struct cv1k_machine *m, cv1k_u32 phys)
 {
+    if (sh7709s_c23jit_enabled()) sh7709s_c23jit_reset();
     cv1k_u32 base;
     cv1k_u32 p;
     cv1k_u32 idx;
@@ -1092,6 +1188,7 @@ void cv1k_bus_invalidate_icache_all(struct cv1k_bus *bus)
     m = bus->machine;
     if (m == NULL) return;
     memset(m->icache_valid, 0, sizeof(m->icache_valid));
+    if (sh7709s_c23jit_enabled()) sh7709s_c23jit_reset();
 }
 
 static void cv1k_bus_invalidate_dcache_all(struct cv1k_bus *bus)
@@ -1128,7 +1225,7 @@ cv1k_u16 cv1k_bus_fetch16(struct cv1k_bus *bus, cv1k_u32 addr)
     m = bus->machine;
     if (m == NULL) return 0xffffU;
     phys = cpu_addr_translate(m, addr) & 0xfffffffeUL;
-    mame_cache_meta_access(m, addr, phys, 0, 1);
+    if (CV1K_UNLIKELY(m->mame_cache_meta)) mame_cache_meta_access(m, addr, phys, 0, 1);
     if (in_range(phys, CV1K_ADDR_WORK_RAM, m->main_ram_size)) {
         if (icache_lookup16(m, phys, &op)) {
             m->icache_hits++;
@@ -1143,16 +1240,27 @@ cv1k_u16 cv1k_bus_fetch16(struct cv1k_bus *bus, cv1k_u32 addr)
     return cv1k_bus_read16(bus, addr);
 }
 
-cv1k_u32 cv1k_bus_read32(struct cv1k_bus *bus, cv1k_u32 addr)
+CV1K_HOT cv1k_u32 cv1k_bus_read32(struct cv1k_bus *bus, cv1k_u32 addr)
 {
+    struct cv1k_machine *m;
+    cv1k_u32 phys;
+    cv1k_u32 original_addr;
     cv1k_u32 a;
     cv1k_u32 b;
+    m = bus ? bus->machine : NULL;
+    if (m == NULL) return 0xffffffffUL;
+    original_addr = addr;
+    phys = cpu_addr_translate(m, addr);
+    if (in_range(phys, CV1K_ADDR_BLITTER, CV1K_REGION_BLITTER_SIZE) && ((phys & 3UL) == 0UL)) {
+        if (CV1K_UNLIKELY(m->mame_cache_meta)) mame_cache_meta_access(m, original_addr, phys, 0, 0);
+        return cv1k_bus_blitter_read32(m, phys);
+    }
     a = (cv1k_u32)cv1k_bus_read16(bus, addr);
     b = (cv1k_u32)cv1k_bus_read16(bus, addr + 2UL);
     return (a << 16) | b;
 }
 
-void cv1k_bus_write8(struct cv1k_bus *bus, cv1k_u32 addr, cv1k_u8 data)
+CV1K_HOT void cv1k_bus_write8(struct cv1k_bus *bus, cv1k_u32 addr, cv1k_u8 data)
 {
     struct cv1k_machine *m;
     cv1k_u32 off;
@@ -1161,7 +1269,7 @@ void cv1k_bus_write8(struct cv1k_bus *bus, cv1k_u32 addr, cv1k_u8 data)
     if (m == NULL) return;
     original_addr = addr;
     addr = cpu_addr_translate(m, addr);
-    mame_cache_meta_access(m, original_addr, addr, 1, 0);
+    if (CV1K_UNLIKELY(m->mame_cache_meta)) mame_cache_meta_access(m, original_addr, addr, 1, 0);
 
     if (in_range(addr, CV1K_ADDR_SH_IO, CV1K_REGION_SH_IO_SIZE)) {
         sh_io_port_w(m, addr - CV1K_ADDR_SH_IO, data);
@@ -1213,14 +1321,41 @@ void cv1k_bus_write8(struct cv1k_bus *bus, cv1k_u32 addr, cv1k_u8 data)
     m->last_unmapped_write_data = (cv1k_u32)data;
 }
 
-void cv1k_bus_write16(struct cv1k_bus *bus, cv1k_u32 addr, cv1k_u16 data)
+CV1K_HOT void cv1k_bus_write16(struct cv1k_bus *bus, cv1k_u32 addr, cv1k_u16 data)
 {
     cv1k_bus_write8(bus, addr, (cv1k_u8)((data >> 8) & 0xffU));
     cv1k_bus_write8(bus, addr + 1UL, (cv1k_u8)(data & 0xffU));
 }
 
-void cv1k_bus_write32(struct cv1k_bus *bus, cv1k_u32 addr, cv1k_u32 data)
+CV1K_HOT void cv1k_bus_write32(struct cv1k_bus *bus, cv1k_u32 addr, cv1k_u32 data)
 {
+    struct cv1k_machine *m;
+    cv1k_u32 phys;
+    cv1k_u32 original_addr;
+    m = bus ? bus->machine : NULL;
+    if (m == NULL) return;
+    original_addr = addr;
+    phys = cpu_addr_translate(m, addr);
+
+    if (CV1K_LIKELY((phys & 3UL) == 0UL)) {
+        if (in_range(phys, CV1K_ADDR_BLITTER, CV1K_REGION_BLITTER_SIZE)) {
+            if (CV1K_UNLIKELY(m->mame_cache_meta)) mame_cache_meta_access(m, original_addr, phys, 1, 0);
+            cv1k_video_write32(&m->video, phys - CV1K_ADDR_BLITTER, data, m->main_ram, m->main_ram_size);
+            return;
+        }
+        if (in_range(phys, CV1K_ADDR_WORK_RAM, m->main_ram_size) && !m->dcache_enabled) {
+            cv1k_u32 off = phys - CV1K_ADDR_WORK_RAM;
+            if (CV1K_UNLIKELY(m->mame_cache_meta)) mame_cache_meta_access(m, original_addr, phys, 1, 0);
+            if (off + 3UL < m->main_ram_size) {
+                m->main_ram[off] = (cv1k_u8)((data >> 24) & 0xffU);
+                m->main_ram[off + 1UL] = (cv1k_u8)((data >> 16) & 0xffU);
+                m->main_ram[off + 2UL] = (cv1k_u8)((data >> 8) & 0xffU);
+                m->main_ram[off + 3UL] = (cv1k_u8)(data & 0xffU);
+                return;
+            }
+        }
+    }
+
     cv1k_bus_write16(bus, addr, (cv1k_u16)((data >> 16) & 0xffffUL));
     cv1k_bus_write16(bus, addr + 2UL, (cv1k_u16)(data & 0xffffUL));
 }

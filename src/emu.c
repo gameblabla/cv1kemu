@@ -24,6 +24,10 @@ int cv1k_machine_init(struct cv1k_machine *m, int model)
     cv1k_u32 ram_size;
     memset(m, 0, sizeof(*m));
     m->model = model;
+    m->display_rotation = CV1K_DISPLAY_ROT_CCW;
+    m->video_renderer = CV1K_VIDEO_RENDERER_SOFTWARE;
+    m->gles2_tile_cache = 1;
+    m->gles2_gpu_blitter = 0;
     ram_size = (model == CV1K_MODEL_D) ? CV1K_MAIN_RAM_D_SIZE : CV1K_MAIN_RAM_B_SIZE;
     m->boot_rom = (cv1k_u8 *)cv1k_xmalloc(CV1K_BOOT_ROM_MAX);
     m->main_ram = (cv1k_u8 *)cv1k_xmalloc(ram_size);
@@ -182,6 +186,7 @@ void cv1k_machine_reset(struct cv1k_machine *m)
     memset(m->dma_timer_due, 0, sizeof(m->dma_timer_due));
     memset(m->dma_timer_chcr, 0, sizeof(m->dma_timer_chcr));
     memset(m->dma_timer_base, 0, sizeof(m->dma_timer_base));
+    m->dma_timer_mask = 0UL;
     m->last_dma_nand_page0 = 0UL;
     m->last_dma_nand_page1 = 0UL;
     m->last_dma_nand_block0 = 0UL;
@@ -201,6 +206,11 @@ void cv1k_machine_reset(struct cv1k_machine *m)
     m->exception_last_event = 0UL;
     m->exception_last_tra = 0UL;
     m->mame_speedup_spins = 0UL;
+    m->threaded_render = 0;
+    m->threaded_audio = 0;
+    m->threaded_render_jobs = 0UL;
+    m->threaded_audio_jobs = 0UL;
+    m->render_screen = 1;
     memset(m->tmu_underflows, 0, sizeof(m->tmu_underflows));
     memset(m->tmu_last_cycles, 0, sizeof(m->tmu_last_cycles));
     m->tmu_last_event = 0UL;
@@ -226,6 +236,9 @@ void cv1k_machine_reset(struct cv1k_machine *m)
     m->auto_blit_last_end = 0UL;
     m->auto_blit_last_sig = 0UL;
     m->auto_blit_skips = 0UL;
+    m->video_busy_sync_cycles = m->cpu.cycles;
+    m->last_blitter_status_pc = 0UL;
+    m->blitter_status_spin_reads = 0UL;
 }
 
 
@@ -827,7 +840,33 @@ void cv1k_machine_step(struct cv1k_machine *m)
     sh7709s_step(&m->cpu, &m->bus);
 }
 
-void cv1k_machine_frame(struct cv1k_machine *m)
+
+void cv1k_machine_sync_video_busy(struct cv1k_machine *m)
+{
+    cv1k_u32 delta;
+    if (m == NULL) return;
+    delta = m->cpu.cycles - m->video_busy_sync_cycles;
+    if (delta != 0UL) {
+        cv1k_video_tick_cycles(&m->video, delta);
+        m->video_busy_sync_cycles = m->cpu.cycles;
+    }
+}
+
+void cv1k_machine_fast_forward_blitter_busy(struct cv1k_machine *m)
+{
+    cv1k_u32 left;
+    if (m == NULL) return;
+    cv1k_machine_sync_video_busy(m);
+    left = m->video.busy_cycles_left;
+    if (left != 0UL) {
+        m->cpu.cycles += left;
+        cv1k_video_tick_cycles(&m->video, left);
+        m->video_busy_sync_cycles = m->cpu.cycles;
+        m->mame_speedup_spins++;
+    }
+}
+
+void cv1k_machine_frame_advance(struct cv1k_machine *m, int render)
 {
     cv1k_u32 cycles_before;
     cv1k_u32 guard;
@@ -871,7 +910,7 @@ void cv1k_machine_frame(struct cv1k_machine *m)
         m->last_active_pc = m->cpu.pc;
     }
 
-    cv1k_video_tick_cycles(&m->video, m->cpu.cycles - cycles_before);
+    cv1k_machine_sync_video_busy(m);
 
     /* Assert IRQ2 at the vsync pulse (MAME cv1k irq2_line_hold).  The handler
      * is serviced at the start of the next frame, matching hardware. */
@@ -882,8 +921,14 @@ void cv1k_machine_frame(struct cv1k_machine *m)
         m->irq_last_level = (cv1k_u32)irq_pri;
     }
 
-    cv1k_video_frame(&m->video, m->main_ram, m->main_ram_size);
+    if (render) cv1k_video_frame(&m->video, m->main_ram, m->main_ram_size);
     m->frames++;
+}
+
+void cv1k_machine_frame(struct cv1k_machine *m)
+{
+    if (m == NULL) return;
+    cv1k_machine_frame_advance(m, m->render_screen);
 }
 
 void cv1k_machine_status(const struct cv1k_machine *m, char *out, cv1k_u32 out_size)
@@ -926,6 +971,10 @@ void cv1k_machine_status(const struct cv1k_machine *m, char *out, cv1k_u32 out_s
         (unsigned long)m->dma_timer_active[1],
         (unsigned long)m->dma_timer_active[2],
         (unsigned long)m->dma_timer_active[3]);
+    p += sprintf(p, "vgpu=%lu/%lu/%lu ",
+        (unsigned long)m->video.gpu_attempted_ops,
+        (unsigned long)m->video.gpu_executed_ops,
+        (unsigned long)m->video.gpu_fallback_ops);
     p += sprintf(p, "scroll=%lu/%lu clip=%ld,%ld,%ld,%ld list=%06lx lup=%06lx:%lu,%lu,%lu,%lu/%lu/%lu ldr=%06lx:%04lx/%04lx:%lu,%lu>%ld,%ld:%lu,%lu/%lu/%lu/%lu fnz=%lu ",
         (unsigned long)m->video.gfx_scroll_x,
         (unsigned long)m->video.gfx_scroll_y,
@@ -990,7 +1039,7 @@ void cv1k_machine_status(const struct cv1k_machine *m, char *out, cv1k_u32 out_s
         (long)m->video.fpga_firmware_version,
         (unsigned long)m->icache_hits,
         (unsigned long)m->icache_misses);
-    p += sprintf(p, "dcache=%lu/%lu stale=%lu mcache=%d/%lu/%lu/%lu/%lu/%lu/%lu cachectl=%d mtrap=%d mspeed=%d/%lu active=%08lx breg=%08lx/%08lx/%08lx/%08lx mmio=%lu/%08lx autoblit=%lu/%06lx-%06lx skip=%lu fulldma=%d mtmu=%d widep0=%d compact400=%d dmasync=%d dmainv=%lu ndata=%d ports=C%02x/%lu@%08lx D%02x/%lu@%08lx E%02x/%lu@%08lx F%02x/%lu@%08lx L%02x/%lu@%08lx nandcmd=%02lx pg=%lu col=%lu rnd=%lu spr=%lu nmap=%lu/%lu/%lu/%lu ce=%d ",
+    p += sprintf(p, "dcache=%lu/%lu stale=%lu mcache=%d/%lu/%lu/%lu/%lu/%lu/%lu cachectl=%d mtrap=%d mspeed=%d/%lu active=%08lx breg=%08lx/%08lx/%08lx/%08lx mmio=%lu/%08lx autoblit=%lu/%06lx-%06lx skip=%lu fulldma=%d mtmu=%d mt=%d/%d/%lu/%lu widep0=%d compact400=%d dmasync=%d dmainv=%lu ndata=%d ports=C%02x/%lu@%08lx D%02x/%lu@%08lx E%02x/%lu@%08lx F%02x/%lu@%08lx L%02x/%lu@%08lx nandcmd=%02lx pg=%lu col=%lu rnd=%lu spr=%lu nmap=%lu/%lu/%lu/%lu ce=%d ",
         (unsigned long)m->dcache_hits,
         (unsigned long)m->dcache_misses,
         (unsigned long)m->dcache_dma_stale,
@@ -1018,6 +1067,10 @@ void cv1k_machine_status(const struct cv1k_machine *m, char *out, cv1k_u32 out_s
         (unsigned long)m->auto_blit_skips,
         m->mame_full_dmatcr,
         m->mame_tmu_irq,
+        m->threaded_render,
+        m->threaded_audio,
+        (unsigned long)m->threaded_render_jobs,
+        (unsigned long)m->threaded_audio_jobs,
         m->wide_p0_alias,
         m->compact_400_alias,
         m->dma_cache_sync,

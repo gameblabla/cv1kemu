@@ -24,4 +24,24 @@ typedef unsigned int cv1k_bool;
 
 #define CV1K_UNUSED(x) ((void)(x))
 
+#if defined(__GNUC__) || defined(__clang__)
+#define CV1K_HOT __attribute__((hot))
+#define CV1K_COLD __attribute__((cold))
+#define CV1K_ALWAYS_INLINE inline __attribute__((always_inline))
+#define CV1K_PURE __attribute__((pure))
+#define CV1K_LIKELY(x) __builtin_expect(!!(x), 1)
+#define CV1K_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define CV1K_ALIGNED(n) __attribute__((aligned(n)))
+#else
+#define CV1K_HOT
+#define CV1K_COLD
+#define CV1K_ALWAYS_INLINE inline
+#define CV1K_PURE
+#define CV1K_LIKELY(x) (x)
+#define CV1K_UNLIKELY(x) (x)
+#define CV1K_ALIGNED(n)
+#endif
+
+#define CV1K_CACHE_ALIGN 64U
+
 #endif

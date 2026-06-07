@@ -17,24 +17,41 @@
 #include "video.h"
 #include "platform.h"
 #include "mame_cv1k_derived.h"
+#include <stdalign.h>
+
+/* The renderer's inner loops call the MAME 5-bit blend tables billions of
+ * times over long runs.  The checked functions remain exported for other
+ * users, but video.c builds the tables during cv1k_video_init(), so direct
+ * table macros are safe here and avoid three function calls per RGB pixel
+ * operation. */
+#define CV1K_MUL5(x,y) (cv1k_mame_colrtable[(x) & 0x1fU][(y) & 0x3fU])
+#define CV1K_MUL5_REV(x,y) (cv1k_mame_colrtable_rev[(x) & 0x1fU][(y) & 0x3fU])
+#define CV1K_ADD5(x,y) (cv1k_mame_colrtable_add[(x) & 0x1fU][(y) & 0x1fU])
+#define cv1k_mame_mul5(x,y) CV1K_MUL5((x),(y))
+#define cv1k_mame_mul5_rev(x,y) CV1K_MUL5_REV((x),(y))
+#define cv1k_mame_add5(x,y) CV1K_ADD5((x),(y))
 #include <stdio.h>
 #include <string.h>
 
-static cv1k_u32 rgb1555_to_rgb888(cv1k_u16 p)
+static alignas(CV1K_CACHE_ALIGN) cv1k_u32 cv1k_rgb1555_table[65536];
+static cv1k_u8 cv1k_rgb1555_table_ready;
+
+static void cv1k_build_rgb1555_table(void)
 {
-    cv1k_u32 r;
-    cv1k_u32 g;
-    cv1k_u32 b;
-    r = (cv1k_u32)((p >> 10) & 0x1fU);
-    g = (cv1k_u32)((p >> 5) & 0x1fU);
-    b = (cv1k_u32)(p & 0x1fU);
-    /* MAME clr_t::to_pen() shifts 5-bit channels to the high bits only;
-     * it does not replicate the low bits as a generic RGB555 converter would.
-     */
-    r = r << 3;
-    g = g << 3;
-    b = b << 3;
-    return (r << 16) | (g << 8) | b;
+    cv1k_u32 i;
+    if (cv1k_rgb1555_table_ready) return;
+    for (i = 0UL; i < 65536UL; i++) {
+        cv1k_u32 r = (i >> 10) & 0x1fU;
+        cv1k_u32 g = (i >> 5) & 0x1fU;
+        cv1k_u32 b = i & 0x1fU;
+        cv1k_rgb1555_table[i] = (r << 19) | (g << 11) | (b << 3);
+    }
+    cv1k_rgb1555_table_ready = 1U;
+}
+
+static CV1K_ALWAYS_INLINE cv1k_u32 rgb1555_to_rgb888(cv1k_u16 p)
+{
+    return cv1k_rgb1555_table[p];
 }
 
 static cv1k_u16 make1555(cv1k_u8 r, cv1k_u8 g, cv1k_u8 b, cv1k_u8 a)
@@ -212,7 +229,7 @@ static struct cv1k_clr5 clr5_blend_smode2(struct cv1k_clr5 s, struct cv1k_clr5 d
     }
 }
 
-static cv1k_u16 blend_pixel(cv1k_u16 src, cv1k_u16 dst, cv1k_u8 src_alpha, cv1k_u8 dst_alpha, int src_mode, int dst_mode)
+static CV1K_HOT cv1k_u16 blend_pixel(cv1k_u16 src, cv1k_u16 dst, cv1k_u8 src_alpha, cv1k_u8 dst_alpha, int src_mode, int dst_mode)
 {
     struct cv1k_clr5 s;
     struct cv1k_clr5 d;
@@ -292,10 +309,77 @@ cv1k_u32 cv1k_video_vram_bytes(void)
     return (cv1k_u32)(CV1K_VRAM_PIXELS * sizeof(cv1k_u16));
 }
 
+void cv1k_video_set_gpu_accel(struct cv1k_video *video, const struct cv1k_video_gpu_ops *ops, void *userdata)
+{
+    if (video == NULL) return;
+    video->gpu_ops = ops;
+    video->gpu_userdata = userdata;
+    video->gpu_attempted_ops = 0UL;
+    video->gpu_executed_ops = 0UL;
+    video->gpu_fallback_ops = 0UL;
+    if (ops != NULL && ops->invalidate_all != NULL) ops->invalidate_all(userdata);
+}
+
+static CV1K_ALWAYS_INLINE cv1k_u32 vram_tile_index(cv1k_u32 tx, cv1k_u32 ty)
+{
+    return (ty * CV1K_VRAM_TILES_X) + tx;
+}
+
+void cv1k_video_mark_vram_dirty_all(struct cv1k_video *video)
+{
+    cv1k_u32 i;
+    cv1k_u32 gen;
+    if (video == NULL) return;
+    gen = video->vram_dirty_generation + 1UL;
+    if (gen == 0UL) {
+        gen = 1UL;
+        memset(video->vram_tile_generation, 0, sizeof(video->vram_tile_generation));
+    }
+    video->vram_dirty_generation = gen;
+    for (i = 0UL; i < CV1K_VRAM_TILE_COUNT; i++) video->vram_tile_generation[i] = gen;
+    if (video->gpu_ops != NULL && video->gpu_ops->invalidate_all != NULL) video->gpu_ops->invalidate_all(video->gpu_userdata);
+}
+
+void cv1k_video_mark_vram_dirty_rect(struct cv1k_video *video, cv1k_u32 x, cv1k_u32 y, cv1k_u32 w, cv1k_u32 h)
+{
+    cv1k_u32 tx0;
+    cv1k_u32 ty0;
+    cv1k_u32 tx1;
+    cv1k_u32 ty1;
+    cv1k_u32 tx;
+    cv1k_u32 ty;
+    cv1k_u32 gen;
+    if (video == NULL || w == 0UL || h == 0UL || x >= CV1K_VRAM_W || y >= CV1K_VRAM_H) return;
+    if (w > CV1K_VRAM_W - x) w = CV1K_VRAM_W - x;
+    if (h > CV1K_VRAM_H - y) h = CV1K_VRAM_H - y;
+    gen = video->vram_dirty_generation + 1UL;
+    if (gen == 0UL) {
+        gen = 1UL;
+        memset(video->vram_tile_generation, 0, sizeof(video->vram_tile_generation));
+    }
+    video->vram_dirty_generation = gen;
+    tx0 = x / CV1K_VRAM_TILE_W;
+    ty0 = y / CV1K_VRAM_TILE_H;
+    tx1 = (x + w - 1UL) / CV1K_VRAM_TILE_W;
+    ty1 = (y + h - 1UL) / CV1K_VRAM_TILE_H;
+    if (tx1 >= CV1K_VRAM_TILES_X) tx1 = CV1K_VRAM_TILES_X - 1UL;
+    if (ty1 >= CV1K_VRAM_TILES_Y) ty1 = CV1K_VRAM_TILES_Y - 1UL;
+    for (ty = ty0; ty <= ty1; ty++) {
+        for (tx = tx0; tx <= tx1; tx++) video->vram_tile_generation[vram_tile_index(tx, ty)] = gen;
+    }
+}
+
+cv1k_u32 cv1k_video_vram_tile_generation(const struct cv1k_video *video, cv1k_u32 tx, cv1k_u32 ty)
+{
+    if (video == NULL || tx >= CV1K_VRAM_TILES_X || ty >= CV1K_VRAM_TILES_Y) return 0UL;
+    return video->vram_tile_generation[vram_tile_index(tx, ty)];
+}
+
 int cv1k_video_init(struct cv1k_video *video)
 {
     memset(video, 0, sizeof(*video));
     cv1k_mame_build_color_tables();
+    cv1k_build_rgb1555_table();
     video->vram1555 = (cv1k_u16 *)cv1k_xmalloc(cv1k_video_vram_bytes());
     video->screen_rgb = (cv1k_u32 *)cv1k_xmalloc((cv1k_u32)(CV1K_FRAMEBUFFER_W * CV1K_FRAMEBUFFER_H * sizeof(cv1k_u32)));
     if (video->vram1555 == NULL || video->screen_rgb == NULL) return 0;
@@ -368,6 +452,9 @@ void cv1k_video_reset(struct cv1k_video *video)
     video->fpga_firmware_version = -1L;
     video->fpga_firmware_port = 0U;
     video->fpga_firmware_byte = 0U;
+    video->vram_dirty_generation = 0UL;
+    memset(video->vram_tile_generation, 0, sizeof(video->vram_tile_generation));
+    cv1k_video_mark_vram_dirty_all(video);
 }
 
 cv1k_u8 cv1k_video_fpga_read(struct cv1k_video *video)
@@ -404,7 +491,7 @@ void cv1k_video_fpga_write(struct cv1k_video *video, cv1k_u8 data)
     video->fpga_firmware_port = data;
 }
 
-static cv1k_u32 cv1k_video_read32_mame(const struct cv1k_video *video, cv1k_u32 regoff)
+cv1k_u32 cv1k_video_read32(struct cv1k_video *video, cv1k_u32 regoff)
 {
     /* ANSI C adaptation of MAME cv1k_blitter_device::blitter_r.
      * The MAME device only returns defined values for ready/status, two
@@ -429,7 +516,7 @@ cv1k_u8 cv1k_video_read8(struct cv1k_video *video, cv1k_u32 offset)
     cv1k_u32 v;
     cv1k_u32 shift;
     if (offset >= CV1K_REGION_BLITTER_SIZE) return 0xffU;
-    v = cv1k_video_read32_mame(video, offset);
+    v = cv1k_video_read32(video, offset);
     shift = (3UL - (offset & 3UL)) * 8UL;
     return (cv1k_u8)((v >> shift) & 0xffUL);
 }
@@ -502,30 +589,27 @@ static void idle_blitter_mame(struct cv1k_video *video, cv1k_u32 operation_size_
     }
 }
 
+static cv1k_u32 calculate_vram_axis_rows_mame(cv1k_u32 start, cv1k_u32 dim)
+{
+    cv1k_u32 full;
+    cv1k_u32 rem;
+    cv1k_u32 rows;
+    cv1k_u32 off;
+    if (dim == 0UL) return 0UL;
+    off = start & 31UL;
+    full = dim >> 5;
+    rem = dim & 31UL;
+    rows = full + ((rem != 0UL) ? 1UL : 0UL);
+    if (off != 0UL) {
+        rows += full;
+        if (rem != 0UL && off + rem > 32UL) rows++;
+    }
+    return rows;
+}
+
 static cv1k_u32 calculate_vram_accesses_mame(cv1k_u32 start_x, cv1k_u32 start_y, cv1k_u32 dimx, cv1k_u32 dimy)
 {
-    cv1k_u32 x_rows;
-    cv1k_u32 num_vram_rows;
-    cv1k_u32 x_pixels;
-    cv1k_u32 y_pixels;
-    cv1k_u32 chunk;
-    x_rows = 0UL;
-    num_vram_rows = 0UL;
-    for (x_pixels = dimx; x_pixels > 0UL; ) {
-        chunk = (x_pixels < 32UL) ? x_pixels : 32UL;
-        x_rows++;
-        if (((start_x & 31UL) + chunk) > 32UL) x_rows++;
-        if (x_pixels <= 32UL) break;
-        x_pixels -= 32UL;
-    }
-    for (y_pixels = dimy; y_pixels > 0UL; ) {
-        chunk = (y_pixels < 32UL) ? y_pixels : 32UL;
-        num_vram_rows += x_rows;
-        if (((start_y & 31UL) + chunk) > 32UL) num_vram_rows += x_rows;
-        if (y_pixels <= 32UL) break;
-        y_pixels -= 32UL;
-    }
-    return num_vram_rows;
+    return calculate_vram_axis_rows_mame(start_x, dimx) * calculate_vram_axis_rows_mame(start_y, dimy);
 }
 
 static void finish_blit_delay_mame(struct cv1k_video *video)
@@ -538,7 +622,7 @@ static void finish_blit_delay_mame(struct cv1k_video *video)
     if (video->busy_cycles_ns > CV1K_FRAME_DURATION_NANOSEC) video->blit_over_frame_count++;
 }
 
-static cv1k_u32 execute_upload(struct cv1k_video *video, cv1k_u32 addr, const cv1k_u8 *ram, cv1k_u32 ram_size)
+static CV1K_HOT cv1k_u32 execute_upload(struct cv1k_video *video, cv1k_u32 addr, const cv1k_u8 *ram, cv1k_u32 ram_size)
 {
     cv1k_u32 dst_x;
     cv1k_u32 dst_y;
@@ -580,6 +664,20 @@ static cv1k_u32 execute_upload(struct cv1k_video *video, cv1k_u32 addr, const cv
             }
         }
     }
+    if (w != 0UL && h != 0UL) cv1k_video_mark_vram_dirty_rect(video, dst_x, dst_y, w, h);
+    if (video->gpu_ops != NULL && video->gpu_ops->upload != NULL && w != 0UL && h != 0UL) {
+        struct cv1k_video_gpu_upload_cmd gpu_cmd;
+        int gpu_ok;
+        gpu_cmd.addr = addr;
+        gpu_cmd.dst_x = dst_x;
+        gpu_cmd.dst_y = dst_y;
+        gpu_cmd.w = w;
+        gpu_cmd.h = h;
+        video->gpu_attempted_ops++;
+        gpu_ok = video->gpu_ops->upload(video->gpu_userdata, video, &gpu_cmd, ram, ram_size);
+        if (gpu_ok) video->gpu_executed_ops++;
+        else video->gpu_fallback_ops++;
+    }
     video->last_upload_nonzero = nonzero;
     video->upload_nonzero_total += nonzero;
     video->upload_ops++;
@@ -588,7 +686,7 @@ static cv1k_u32 execute_upload(struct cv1k_video *video, cv1k_u32 addr, const cv
     return pos;
 }
 
-static cv1k_u32 execute_draw(struct cv1k_video *video, cv1k_u32 addr, const cv1k_u8 *ram, cv1k_u32 ram_size)
+static CV1K_HOT cv1k_u32 execute_draw(struct cv1k_video *video, cv1k_u32 addr, const cv1k_u8 *ram, cv1k_u32 ram_size)
 {
     cv1k_u16 flags;
     cv1k_u16 alphaw;
@@ -624,6 +722,18 @@ static cv1k_u32 execute_draw(struct cv1k_video *video, cv1k_u32 addr, const cv1k
     cv1k_u32 src_nonzero;
     cv1k_u32 written;
     cv1k_u32 written_nonzero;
+    cv1k_s32 clip_l;
+    cv1k_s32 clip_t;
+    cv1k_s32 clip_r;
+    cv1k_s32 clip_b;
+    cv1k_s32 vis_l;
+    cv1k_s32 vis_t;
+    cv1k_s32 vis_r;
+    cv1k_s32 vis_b;
+    cv1k_u32 px0;
+    cv1k_u32 px1;
+    cv1k_u32 py0;
+    cv1k_u32 py1;
     flags = read_ram16(ram, ram_size, addr + 0UL);
     alphaw = read_ram16(ram, ram_size, addr + 2UL);
     src_x = (cv1k_u32)(read_ram16(ram, ram_size, addr + 4UL) & 0x1fffU);
@@ -671,28 +781,102 @@ static cv1k_u32 execute_draw(struct cv1k_video *video, cv1k_u32 addr, const cv1k
     src_nonzero = 0UL;
     written = 0UL;
     written_nonzero = 0UL;
-    for (py = 0UL; py < h; py++) {
-        sy = ((flags & 0x0400U) != 0U) ? (src_y + (h - 1UL - py)) : (src_y + py);
-        dy = dst_y + (cv1k_s32)py;
-        if (dy >= (cv1k_s32)CV1K_VRAM_H) continue;
-        for (px = 0UL; px < w; px++) {
-            sx = ((flags & 0x0800U) != 0U) ? (src_x + (w - 1UL - px)) : (src_x + px);
-            dx = dst_x + (cv1k_s32)px;
-            if (dx < video->clip_x || dy < video->clip_y) continue;
-            if (dx >= video->clip_x + video->clip_w || dy >= video->clip_y + video->clip_h) continue;
-            if (dx < 0 || (cv1k_u32)dx >= CV1K_VRAM_W || dy < 0 || (cv1k_u32)dy >= CV1K_VRAM_H) continue;
-            src = video->vram1555[vram_index(sx, sy)];
-            if ((src & 0x7fffU) != 0U) src_nonzero++;
-            if ((flags & 0x0100U) != 0U && (src & 0x8000U) == 0U) continue;
-            if (tint_enabled) src = apply_tint(src, mul_r, mul_g, mul_b);
-            if (blend_enabled) {
-                dst = video->vram1555[vram_index((cv1k_u32)dx, (cv1k_u32)dy)];
-                src = blend_pixel(src, dst, src_alpha, dst_alpha, (int)src_mode, (int)dst_mode);
+
+    clip_l = video->clip_x;
+    clip_t = video->clip_y;
+    clip_r = video->clip_x + video->clip_w;
+    clip_b = video->clip_y + video->clip_h;
+    if (clip_l < 0) clip_l = 0;
+    if (clip_t < 0) clip_t = 0;
+    if (clip_r > (cv1k_s32)CV1K_VRAM_W) clip_r = (cv1k_s32)CV1K_VRAM_W;
+    if (clip_b > (cv1k_s32)CV1K_VRAM_H) clip_b = (cv1k_s32)CV1K_VRAM_H;
+    vis_l = dst_x > clip_l ? dst_x : clip_l;
+    vis_t = dst_y > clip_t ? dst_y : clip_t;
+    vis_r = (dst_x + (cv1k_s32)w) < clip_r ? (dst_x + (cv1k_s32)w) : clip_r;
+    vis_b = (dst_y + (cv1k_s32)h) < clip_b ? (dst_y + (cv1k_s32)h) : clip_b;
+
+    if (vis_l < vis_r && vis_t < vis_b && video->vram1555 != NULL) {
+        px0 = (cv1k_u32)(vis_l - dst_x);
+        px1 = (cv1k_u32)(vis_r - dst_x);
+        py0 = (cv1k_u32)(vis_t - dst_y);
+        py1 = (cv1k_u32)(vis_b - dst_y);
+
+        /* The overwhelmingly common CV1000 path during gameplay/UI upload is
+         * an untinted, unblended, alpha-tested atlas copy.  Pre-clip it once
+         * and walk linear rows; this preserves the old forward-copy semantics
+         * while removing four bounds/clip branches and two vram_index() calls
+         * from every visible pixel. */
+        if (CV1K_LIKELY(!blend_enabled && !tint_enabled && (flags & 0x0c00U) == 0U &&
+            src_x + px1 <= CV1K_VRAM_W && src_y + py1 <= CV1K_VRAM_H)) {
+            cv1k_u32 count = px1 - px0;
+            int alpha_test = ((flags & 0x0100U) != 0U);
+            for (py = py0; py < py1; py++) {
+                const cv1k_u16 *sp = video->vram1555 + (src_y + py) * CV1K_VRAM_W + src_x + px0;
+                cv1k_u16 *dp = video->vram1555 + ((cv1k_u32)(dst_y + (cv1k_s32)py)) * CV1K_VRAM_W + (cv1k_u32)(dst_x + (cv1k_s32)px0);
+                for (px = 0UL; px < count; px++) {
+                    src = sp[px];
+                    if ((src & 0x7fffU) != 0U) src_nonzero++;
+                    if (alpha_test && (src & 0x8000U) == 0U) continue;
+                    dp[px] = src;
+                    written++;
+                    if ((src & 0x7fffU) != 0U) written_nonzero++;
+                }
             }
-            video->vram1555[vram_index((cv1k_u32)dx, (cv1k_u32)dy)] = src;
-            written++;
-            if ((src & 0x7fffU) != 0U) written_nonzero++;
+        } else {
+            for (py = py0; py < py1; py++) {
+                sy = ((flags & 0x0400U) != 0U) ? (src_y + (h - 1UL - py)) : (src_y + py);
+                dy = dst_y + (cv1k_s32)py;
+                for (px = px0; px < px1; px++) {
+                    sx = ((flags & 0x0800U) != 0U) ? (src_x + (w - 1UL - px)) : (src_x + px);
+                    dx = dst_x + (cv1k_s32)px;
+                    src = video->vram1555[vram_index(sx, sy)];
+                    if ((src & 0x7fffU) != 0U) src_nonzero++;
+                    if ((flags & 0x0100U) != 0U && (src & 0x8000U) == 0U) continue;
+                    if (tint_enabled) src = apply_tint(src, mul_r, mul_g, mul_b);
+                    if (blend_enabled) {
+                        cv1k_u32 di = (cv1k_u32)dy * CV1K_VRAM_W + (cv1k_u32)dx;
+                        dst = video->vram1555[di];
+                        src = blend_pixel(src, dst, src_alpha, dst_alpha, (int)src_mode, (int)dst_mode);
+                        video->vram1555[di] = src;
+                    } else {
+                        video->vram1555[(cv1k_u32)dy * CV1K_VRAM_W + (cv1k_u32)dx] = src;
+                    }
+                    written++;
+                    if ((src & 0x7fffU) != 0U) written_nonzero++;
+                }
+            }
         }
+    }
+    if (written != 0UL) {
+        cv1k_video_mark_vram_dirty_rect(video, (cv1k_u32)vis_l, (cv1k_u32)vis_t, (cv1k_u32)(vis_r - vis_l), (cv1k_u32)(vis_b - vis_t));
+    }
+    if (video->gpu_ops != NULL && video->gpu_ops->draw != NULL && written != 0UL) {
+        struct cv1k_video_gpu_draw_cmd gpu_cmd;
+        int gpu_ok;
+        gpu_cmd.flags = flags;
+        gpu_cmd.alphaw = alphaw;
+        gpu_cmd.src_x = src_x;
+        gpu_cmd.src_y = src_y;
+        gpu_cmd.dst_x = dst_x;
+        gpu_cmd.dst_y = dst_y;
+        gpu_cmd.w = w;
+        gpu_cmd.h = h;
+        gpu_cmd.mul_r = mul_r;
+        gpu_cmd.mul_g = mul_g;
+        gpu_cmd.mul_b = mul_b;
+        gpu_cmd.clip_x = video->clip_x;
+        gpu_cmd.clip_y = video->clip_y;
+        gpu_cmd.clip_w = video->clip_w;
+        gpu_cmd.clip_h = video->clip_h;
+        gpu_cmd.vis_l = vis_l;
+        gpu_cmd.vis_t = vis_t;
+        gpu_cmd.vis_r = vis_r;
+        gpu_cmd.vis_b = vis_b;
+        gpu_cmd.written = written;
+        video->gpu_attempted_ops++;
+        gpu_ok = video->gpu_ops->draw(video->gpu_userdata, video, &gpu_cmd);
+        if (gpu_ok) video->gpu_executed_ops++;
+        else video->gpu_fallback_ops++;
     }
     video->last_draw_src_nonzero = src_nonzero;
     video->last_draw_written = written;
@@ -763,7 +947,7 @@ static int bounded_upload_fits(cv1k_u32 addr, cv1k_u32 end_addr, const cv1k_u8 *
     return bounded_command_fits(addr, end_addr, need);
 }
 
-static void cv1k_video_execute_list_from(struct cv1k_video *video, cv1k_u32 addr, cv1k_u32 end_addr, const cv1k_u8 *ram, cv1k_u32 ram_size, cv1k_u32 max_ops)
+static CV1K_HOT void cv1k_video_execute_list_from(struct cv1k_video *video, cv1k_u32 addr, cv1k_u32 end_addr, const cv1k_u8 *ram, cv1k_u32 ram_size, cv1k_u32 max_ops)
 {
     cv1k_u32 i;
     cv1k_u16 op;
@@ -849,21 +1033,73 @@ void cv1k_video_tick_cycles(struct cv1k_video *video, cv1k_u32 cycles)
     }
 }
 
+static cv1k_u32 cv1k_video_measure_list_end(cv1k_u32 addr, const cv1k_u8 *ram, cv1k_u32 ram_size, cv1k_u32 max_ops)
+{
+    cv1k_u32 i;
+    cv1k_u32 pos;
+    if (ram == NULL || ram_size < 2UL) return 0UL;
+    pos = addr % ram_size;
+    for (i = 0UL; i < max_ops; i++) {
+        cv1k_u16 op;
+        if (pos + 2UL > ram_size) return 0UL;
+        op = read_ram16(ram, ram_size, pos);
+        if (op == 0x0000U || op == 0xffffU) return pos + 2UL;
+        switch (op & CV1K_BLIT_OP_MASK) {
+        case CV1K_BLIT_OP_UPLOAD:
+            {
+                cv1k_u32 w;
+                cv1k_u32 h;
+                cv1k_u32 pixels;
+                cv1k_u32 need;
+                if (pos + CV1K_UPLOAD_HEADER_SIZE_BYTES > ram_size) return 0UL;
+                w = (cv1k_u32)(read_ram16(ram, ram_size, pos + 12UL) & 0x1fffU) + 1UL;
+                h = (cv1k_u32)(read_ram16(ram, ram_size, pos + 14UL) & 0x0fffU) + 1UL;
+                if (h != 0UL && w > 0xffffffffUL / h) return 0UL;
+                pixels = w * h;
+                if (pixels > (0xffffffffUL - CV1K_UPLOAD_HEADER_SIZE_BYTES) / 2UL) return 0UL;
+                need = CV1K_UPLOAD_HEADER_SIZE_BYTES + pixels * 2UL;
+                if (pos + need < pos || pos + need > ram_size) return 0UL;
+                pos += need;
+            }
+            break;
+        case CV1K_BLIT_OP_DRAW:
+            if (pos + CV1K_DRAW_OPERATION_SIZE_BYTES < pos || pos + CV1K_DRAW_OPERATION_SIZE_BYTES > ram_size) return 0UL;
+            pos += CV1K_DRAW_OPERATION_SIZE_BYTES;
+            break;
+        case CV1K_BLIT_OP_CLIP:
+            if (pos + 4UL < pos || pos + 4UL > ram_size) return 0UL;
+            pos += 4UL;
+            break;
+        default:
+            return pos + 2UL;
+        }
+    }
+    return pos;
+}
+
 static void cv1k_video_execute_list_common(struct cv1k_video *video, cv1k_u32 addr, cv1k_u32 end_addr, const cv1k_u8 *ram, cv1k_u32 ram_size, cv1k_u32 max_ops)
 {
     cv1k_u8 *shadow;
-    /* MAME snapshots the blit command stream into m_ram16_copy before queuing
-     * the worker thread.  The sandbox executes synchronously, but using a
-     * read-only RAM snapshot prevents self-modifying command/data writes from
-     * changing an in-flight list and matches the device-level contract more
-     * closely.  Full-RAM snapshotting is deliberately simple and ANSI C.
-     */
+    cv1k_u32 local_addr;
+    cv1k_u32 shadow_size;
+    /* MAME snapshots the blit command stream before queuing the worker.
+     * Earlier sandbox builds copied the full 8/16 MiB work RAM for every
+     * execute pulse.  DDPSDOJ command/upload lists are linear, so first scan
+     * the list bounds and snapshot only the prefix containing the stream; this
+     * preserves self-modifying-list isolation without gigabytes of avoidable
+     * memcpy traffic during boot and attract-mode blits. */
     if (ram == NULL || ram_size < 2UL) return;
     video->last_list_addr = addr;
-    shadow = (cv1k_u8 *)cv1k_xmalloc(ram_size);
+    local_addr = addr % ram_size;
+    shadow_size = 0UL;
+    if (end_addr > local_addr && end_addr <= ram_size) shadow_size = end_addr;
+    else shadow_size = cv1k_video_measure_list_end(local_addr, ram, ram_size, max_ops);
+    if (shadow_size <= local_addr || shadow_size > ram_size) shadow_size = ram_size;
+
+    shadow = (cv1k_u8 *)cv1k_xmalloc(shadow_size);
     if (shadow != NULL) {
-        memcpy(shadow, ram, (size_t)ram_size);
-        cv1k_video_execute_list_from(video, addr, end_addr, shadow, ram_size, max_ops);
+        memcpy(shadow, ram, (size_t)shadow_size);
+        cv1k_video_execute_list_from(video, local_addr, shadow_size, shadow, shadow_size, max_ops);
         cv1k_free(shadow);
     } else {
         cv1k_video_execute_list_from(video, addr, end_addr, ram, ram_size, max_ops);
@@ -880,7 +1116,7 @@ void cv1k_video_execute_list_bounded(struct cv1k_video *video, cv1k_u32 addr, cv
     cv1k_video_execute_list_common(video, addr, end_addr, ram, ram_size, max_ops);
 }
 
-void cv1k_video_write8(struct cv1k_video *video, cv1k_u32 offset, cv1k_u8 data, const cv1k_u8 *ram, cv1k_u32 ram_size)
+CV1K_HOT void cv1k_video_write8(struct cv1k_video *video, cv1k_u32 offset, cv1k_u8 data, const cv1k_u8 *ram, cv1k_u32 ram_size)
 {
     cv1k_u32 index;
     cv1k_u32 shift;
@@ -922,7 +1158,34 @@ void cv1k_video_write8(struct cv1k_video *video, cv1k_u32 offset, cv1k_u8 data, 
     }
 }
 
-void cv1k_video_frame(struct cv1k_video *video, const cv1k_u8 *ram, cv1k_u32 ram_size)
+CV1K_HOT void cv1k_video_write32(struct cv1k_video *video, cv1k_u32 offset, cv1k_u32 data, const cv1k_u8 *ram, cv1k_u32 ram_size)
+{
+    cv1k_u32 regbase;
+    if (video == NULL || offset >= CV1K_REGION_BLITTER_SIZE) return;
+    if ((offset & 3UL) != 0UL) {
+        cv1k_video_write8(video, offset, (cv1k_u8)((data >> 24) & 0xffU), ram, ram_size);
+        cv1k_video_write8(video, offset + 1UL, (cv1k_u8)((data >> 16) & 0xffU), ram, ram_size);
+        cv1k_video_write8(video, offset + 2UL, (cv1k_u8)((data >> 8) & 0xffU), ram, ram_size);
+        cv1k_video_write8(video, offset + 3UL, (cv1k_u8)(data & 0xffU), ram, ram_size);
+        return;
+    }
+    video->regs[offset >> 2] = data;
+    regbase = offset;
+    if (regbase == 0x04UL && (data & 0x01U) != 0U) {
+        cv1k_u32 addr;
+        addr = video->regs[0x08UL >> 2] & 0x1fffffffUL;
+        video->mmio_execs++;
+        video->last_mmio_list_addr = addr;
+        cv1k_video_execute_list(video, addr, ram, ram_size, 4096UL);
+    } else if (regbase == 0x14UL || regbase == 0x18UL) {
+        video->gfx_scroll_x = video->regs[0x14UL >> 2] & 0x1fffUL;
+        video->gfx_scroll_y = video->regs[0x18UL >> 2] & 0x0fffUL;
+    } else if (regbase == 0x40UL || regbase == 0x44UL) {
+        set_exec_clip_from_regs(video);
+    }
+}
+
+CV1K_HOT void cv1k_video_frame(struct cv1k_video *video, const cv1k_u8 *ram, cv1k_u32 ram_size)
 {
     cv1k_u32 x;
     cv1k_u32 y;
@@ -951,18 +1214,206 @@ void cv1k_video_frame(struct cv1k_video *video, const cv1k_u8 *ram, cv1k_u32 ram
 
     frame_nonzero = 0UL;
     for (y = 0UL; y < CV1K_SCREEN_H; y++) {
+        cv1k_u32 *dstrow;
+        const cv1k_u16 *srcrow;
         /* MAME cv1k screen_update: copyscrollbitmap(dst, src, scroll=-m_gfx_scroll)
          * => dst(x,y) = src(x + gfx_scroll_x, y + gfx_scroll_y) with wrap. */
         sy = (y + (video->gfx_scroll_y & (CV1K_VRAM_H - 1UL))) & (CV1K_VRAM_H - 1UL);
-        for (x = 0UL; x < CV1K_SCREEN_W; x++) {
-            sx = (x + (video->gfx_scroll_x & (CV1K_VRAM_W - 1UL))) & (CV1K_VRAM_W - 1UL);
-            pix = video->vram1555[vram_index(sx, sy)];
-            if ((pix & 0x7fffU) != 0U) frame_nonzero++;
-            video->screen_rgb[y * CV1K_FRAMEBUFFER_W + x] = rgb1555_to_rgb888(pix);
+        sx = video->gfx_scroll_x & (CV1K_VRAM_W - 1UL);
+        dstrow = video->screen_rgb + y * CV1K_FRAMEBUFFER_W;
+        if (CV1K_LIKELY(sx + CV1K_SCREEN_W <= CV1K_VRAM_W)) {
+            srcrow = video->vram1555 + sy * CV1K_VRAM_W + sx;
+            for (x = 0UL; x < CV1K_SCREEN_W; x++) {
+                pix = srcrow[x];
+                frame_nonzero += ((pix & 0x7fffU) != 0U);
+                dstrow[x] = rgb1555_to_rgb888(pix);
+            }
+        } else {
+            for (x = 0UL; x < CV1K_SCREEN_W; x++) {
+                cv1k_u32 sxw = (sx + x) & (CV1K_VRAM_W - 1UL);
+                pix = video->vram1555[sy * CV1K_VRAM_W + sxw];
+                frame_nonzero += ((pix & 0x7fffU) != 0U);
+                dstrow[x] = rgb1555_to_rgb888(pix);
+            }
         }
     }
     video->last_frame_nonzero = frame_nonzero;
 }
+
+
+static int cv1k_str_contains_fold(const char *s, const char *needle)
+{
+    cv1k_u32 i;
+    cv1k_u32 j;
+    if (s == NULL || needle == NULL || needle[0] == '\0') return 0;
+    for (i = 0U; s[i] != '\0'; i++) {
+        for (j = 0U; needle[j] != '\0'; j++) {
+            char a = s[i + j];
+            char b = needle[j];
+            if (a >= 'A' && a <= 'Z') a = (char)(a + ('a' - 'A'));
+            if (b >= 'A' && b <= 'Z') b = (char)(b + ('a' - 'A'));
+            if (a != b || a == '\0') break;
+        }
+        if (needle[j] == '\0') return 1;
+    }
+    return 0;
+}
+
+int cv1k_video_display_rotation_parse(const char *name, int *out_rotation)
+{
+    int r;
+    if (name == NULL || out_rotation == NULL) return 0;
+    if (strcmp(name, "auto") == 0) r = CV1K_DISPLAY_ROT_AUTO;
+    else if (strcmp(name, "0") == 0 || strcmp(name, "none") == 0 || strcmp(name, "normal") == 0 || strcmp(name, "landscape") == 0) r = CV1K_DISPLAY_ROT_0;
+    else if (strcmp(name, "cw") == 0 || strcmp(name, "90") == 0 || strcmp(name, "90cw") == 0 || strcmp(name, "right") == 0) r = CV1K_DISPLAY_ROT_CW;
+    else if (strcmp(name, "180") == 0 || strcmp(name, "flip") == 0) r = CV1K_DISPLAY_ROT_180;
+    else if (strcmp(name, "ccw") == 0 || strcmp(name, "270") == 0 || strcmp(name, "90ccw") == 0 || strcmp(name, "left") == 0 || strcmp(name, "tate") == 0) r = CV1K_DISPLAY_ROT_CCW;
+    else return 0;
+    *out_rotation = r;
+    return 1;
+}
+
+const char *cv1k_video_display_rotation_name(int rotation)
+{
+    switch (rotation) {
+    case CV1K_DISPLAY_ROT_0: return "none";
+    case CV1K_DISPLAY_ROT_CW: return "cw";
+    case CV1K_DISPLAY_ROT_180: return "180";
+    case CV1K_DISPLAY_ROT_CCW: return "ccw";
+    default: return "auto";
+    }
+}
+
+int cv1k_video_display_rotation_auto_for_path(const char *path)
+{
+    /* Akai Katana's visible orientation differs from DDPSDOJ in this sandbox.
+     * Keep DDPSDOJ's historical ROT270/CCW frontend default, but use a 90-degree
+     * clockwise frontend transform for akatana.zip / extracted akatana trees.
+     */
+    if (cv1k_str_contains_fold(path, "akatana")) return CV1K_DISPLAY_ROT_CW;
+    return CV1K_DISPLAY_ROT_CCW;
+}
+
+void cv1k_video_display_dimensions(int rotation, cv1k_u32 *out_w, cv1k_u32 *out_h)
+{
+    if (rotation == CV1K_DISPLAY_ROT_AUTO) rotation = CV1K_DISPLAY_ROT_CCW;
+    if (rotation == CV1K_DISPLAY_ROT_CW || rotation == CV1K_DISPLAY_ROT_CCW) {
+        if (out_w != NULL) *out_w = CV1K_SCREEN_H;
+        if (out_h != NULL) *out_h = CV1K_SCREEN_W;
+    } else {
+        if (out_w != NULL) *out_w = CV1K_SCREEN_W;
+        if (out_h != NULL) *out_h = CV1K_SCREEN_H;
+    }
+}
+
+CV1K_HOT cv1k_u32 cv1k_video_display_pixel(const struct cv1k_video *video, int rotation, cv1k_u32 x, cv1k_u32 y)
+{
+    cv1k_u32 sx;
+    cv1k_u32 sy;
+    if (video == NULL || video->screen_rgb == NULL) return 0U;
+    if (rotation == CV1K_DISPLAY_ROT_AUTO) rotation = CV1K_DISPLAY_ROT_CCW;
+    switch (rotation) {
+    case CV1K_DISPLAY_ROT_0:
+        sx = x;
+        sy = y;
+        break;
+    case CV1K_DISPLAY_ROT_CW:
+        sx = y;
+        sy = (CV1K_SCREEN_H - 1U) - x;
+        break;
+    case CV1K_DISPLAY_ROT_180:
+        sx = (CV1K_SCREEN_W - 1U) - x;
+        sy = (CV1K_SCREEN_H - 1U) - y;
+        break;
+    case CV1K_DISPLAY_ROT_CCW:
+    default:
+        sx = (CV1K_SCREEN_W - 1U) - y;
+        sy = x;
+        break;
+    }
+    return video->screen_rgb[sy * CV1K_FRAMEBUFFER_W + sx];
+}
+
+CV1K_HOT void cv1k_video_make_display_xrgb8888(const struct cv1k_video *video, int rotation, cv1k_u32 *dst, cv1k_u32 dst_pitch)
+{
+    cv1k_u32 w;
+    cv1k_u32 h;
+    cv1k_u32 x;
+    cv1k_u32 y;
+    if (video == NULL || video->screen_rgb == NULL || dst == NULL) return;
+    cv1k_video_display_dimensions(rotation, &w, &h);
+    if (dst_pitch < w) return;
+    if (rotation == CV1K_DISPLAY_ROT_AUTO) rotation = CV1K_DISPLAY_ROT_CCW;
+    switch (rotation) {
+    case CV1K_DISPLAY_ROT_0:
+        for (y = 0U; y < CV1K_SCREEN_H; y++) {
+            memcpy(dst + y * dst_pitch, video->screen_rgb + y * CV1K_FRAMEBUFFER_W, (size_t)CV1K_SCREEN_W * sizeof(cv1k_u32));
+        }
+        break;
+    case CV1K_DISPLAY_ROT_CW:
+        for (y = 0U; y < CV1K_SCREEN_W; y++) {
+            cv1k_u32 *d = dst + y * dst_pitch;
+            for (x = 0U; x < CV1K_SCREEN_H; x++) d[x] = video->screen_rgb[((CV1K_SCREEN_H - 1U) - x) * CV1K_FRAMEBUFFER_W + y];
+        }
+        break;
+    case CV1K_DISPLAY_ROT_180:
+        for (y = 0U; y < CV1K_SCREEN_H; y++) {
+            cv1k_u32 *d = dst + y * dst_pitch;
+            const cv1k_u32 *s = video->screen_rgb + ((CV1K_SCREEN_H - 1U) - y) * CV1K_FRAMEBUFFER_W;
+            for (x = 0U; x < CV1K_SCREEN_W; x++) d[x] = s[(CV1K_SCREEN_W - 1U) - x];
+        }
+        break;
+    case CV1K_DISPLAY_ROT_CCW:
+    default:
+        for (y = 0U; y < CV1K_SCREEN_W; y++) {
+            cv1k_u32 *d = dst + y * dst_pitch;
+            cv1k_u32 sx = (CV1K_SCREEN_W - 1U) - y;
+            for (x = 0U; x < CV1K_SCREEN_H; x++) d[x] = video->screen_rgb[x * CV1K_FRAMEBUFFER_W + sx];
+        }
+        break;
+    }
+}
+
+int cv1k_video_write_display_ppm(const struct cv1k_video *video, int rotation, const char *path)
+{
+    FILE *f;
+    cv1k_u32 x;
+    cv1k_u32 y;
+    cv1k_u32 w;
+    cv1k_u32 h;
+    if (video == NULL || video->screen_rgb == NULL || path == NULL) return 0;
+    cv1k_video_display_dimensions(rotation, &w, &h);
+    f = fopen(path, "wb");
+    if (f == NULL) return 0;
+    fprintf(f, "P6\n%u %u\n255\n", (unsigned)w, (unsigned)h);
+    for (y = 0U; y < h; y++) {
+        for (x = 0U; x < w; x++) {
+            cv1k_u32 p = cv1k_video_display_pixel(video, rotation, x, y);
+            fputc((int)((p >> 16) & 0xffU), f);
+            fputc((int)((p >> 8) & 0xffU), f);
+            fputc((int)(p & 0xffU), f);
+        }
+    }
+    fclose(f);
+    return 1;
+}
+
+CV1K_HOT cv1k_u32 cv1k_video_present_checksum(const struct cv1k_video *video)
+{
+    cv1k_u32 x;
+    cv1k_u32 y;
+    cv1k_u32 h = 2166136261UL;
+    if (video == NULL || video->screen_rgb == NULL) return 0UL;
+    for (y = 0UL; y < CV1K_SCREEN_H; y++) {
+        const cv1k_u32 *row = video->screen_rgb + y * CV1K_FRAMEBUFFER_W;
+        for (x = 0UL; x < CV1K_SCREEN_W; x++) {
+            h ^= row[x];
+            h *= 16777619UL;
+        }
+    }
+    return h;
+}
+
 
 int cv1k_video_write_ppm(const struct cv1k_video *video, const char *path)
 {

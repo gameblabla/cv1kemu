@@ -87,6 +87,7 @@ struct cv1k_machine {
     cv1k_u32 dma_timer_due[4];
     cv1k_u32 dma_timer_chcr[4];
     cv1k_u32 dma_timer_base[4];
+    cv1k_u32 dma_timer_mask;
     cv1k_u32 last_dma_nand_page0;
     cv1k_u32 last_dma_nand_page1;
     cv1k_u32 last_dma_nand_block0;
@@ -108,8 +109,17 @@ struct cv1k_machine {
     int vblank_irq_and_tick;
     int mame_trapa;
     int mame_speedup;
+    int render_screen;
     int mame_full_dmatcr;
     int mame_tmu_irq;
+    int threaded_render;
+    int threaded_audio;
+    int display_rotation;
+    int video_renderer;
+    int gles2_tile_cache;
+    int gles2_gpu_blitter;
+    cv1k_u32 threaded_render_jobs;
+    cv1k_u32 threaded_audio_jobs;
     cv1k_u32 mame_speedup_spins;
     cv1k_u32 tmu_underflows[3];
     cv1k_u32 tmu_last_event;
@@ -136,6 +146,9 @@ struct cv1k_machine {
     cv1k_u32 auto_blit_last_end;
     cv1k_u32 auto_blit_last_sig;
     cv1k_u32 auto_blit_skips;
+    cv1k_u32 video_busy_sync_cycles;
+    cv1k_u32 last_blitter_status_pc;
+    cv1k_u32 blitter_status_spin_reads;
 };
 
 int cv1k_machine_init(struct cv1k_machine *m, int model);
@@ -148,6 +161,9 @@ int cv1k_machine_load_ram(struct cv1k_machine *m, const char *path);
 void cv1k_machine_blit(struct cv1k_machine *m, cv1k_u32 addr);
 void cv1k_machine_step(struct cv1k_machine *m);
 void cv1k_machine_frame(struct cv1k_machine *m);
+void cv1k_machine_frame_advance(struct cv1k_machine *m, int render);
+void cv1k_machine_sync_video_busy(struct cv1k_machine *m);
+void cv1k_machine_fast_forward_blitter_busy(struct cv1k_machine *m);
 void cv1k_machine_status(const struct cv1k_machine *m, char *out, cv1k_u32 out_size);
 void cv1k_machine_render_probe(struct cv1k_machine *m, const char *line1, const char *line2, const char *line3);
 

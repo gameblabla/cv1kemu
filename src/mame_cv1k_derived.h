@@ -38,6 +38,10 @@
 #define CV1K_VRAM_H_LINE_DURATION_NANOSEC 2160UL
 #define CV1K_FRAME_DURATION_NANOSEC 16666666UL
 
+extern cv1k_u8 cv1k_mame_colrtable[0x20][0x40];
+extern cv1k_u8 cv1k_mame_colrtable_rev[0x20][0x40];
+extern cv1k_u8 cv1k_mame_colrtable_add[0x20][0x20];
+
 void cv1k_mame_build_color_tables(void);
 cv1k_u8 cv1k_mame_mul5(cv1k_u8 x, cv1k_u8 y);
 cv1k_u8 cv1k_mame_mul5_rev(cv1k_u8 x, cv1k_u8 y);

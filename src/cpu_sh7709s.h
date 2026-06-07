@@ -33,6 +33,7 @@ struct sh7709s_cpu {
      * TMU timer no longer overwrite each other. */
     cv1k_u32 pend_event[8];
     cv1k_u32 pend_pri[8];
+    cv1k_u32 pend_mask;       /* bit i set when pend_event[i] is occupied */
     cv1k_u32 exception_count;
     cv1k_u32 last_illegal_pc;
     cv1k_u32 last_illegal_op;
@@ -50,10 +51,13 @@ void sh7709s_request_irq(struct sh7709s_cpu *cpu, int level);
 void sh7709s_request_irq_line(struct sh7709s_cpu *cpu, int line, int priority);
 void sh7709s_request_irq_event(struct sh7709s_cpu *cpu, cv1k_u32 event, int priority);
 void sh7709s_clear_irq_event(struct sh7709s_cpu *cpu, cv1k_u32 event);
+int sh7709s_accept_pending_irq(struct sh7709s_cpu *cpu, struct cv1k_bus *bus);
 int sh7709s_step(struct sh7709s_cpu *cpu, struct cv1k_bus *bus);
 void sh7709s_run(struct sh7709s_cpu *cpu, struct cv1k_bus *bus, cv1k_u32 instructions);
 cv1k_u32 sh7709s_run_until_idle(struct sh7709s_cpu *cpu, struct cv1k_bus *bus,
                                 cv1k_u32 cycle_budget, cv1k_u32 idle_pc0, cv1k_u32 idle_pc1);
+cv1k_u32 sh7709s_run_frame_interpreter(struct sh7709s_cpu *cpu, struct cv1k_bus *bus,
+                           cv1k_u32 cycle_budget, cv1k_u32 tmu_interval);
 cv1k_u32 sh7709s_run_frame(struct sh7709s_cpu *cpu, struct cv1k_bus *bus,
                            cv1k_u32 cycle_budget, cv1k_u32 tmu_interval);
 

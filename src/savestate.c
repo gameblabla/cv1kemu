@@ -160,6 +160,7 @@ static int load_video(FILE *f, struct cv1k_video *v)
     cv1k_u32 tmp;
     for (i = 0UL; i < (0x58UL / 4UL); i++) if (!read_u32(f, &v->regs[i])) return 0;
     if (!read_u32(f, &size) || size != cv1k_video_vram_bytes() || !read_block(f, v->vram1555, size)) return 0;
+    cv1k_video_mark_vram_dirty_all(v);
     tmp = (cv1k_u32)(CV1K_FRAMEBUFFER_W * CV1K_FRAMEBUFFER_H * sizeof(cv1k_u32));
     if (!read_u32(f, &size) || size != tmp || !read_block(f, v->screen_rgb, size)) return 0;
     if (!read_u32(f, &v->frame_counter) || !read_u32(f, &v->executed_ops) || !read_u32(f, &v->upload_ops) || !read_u32(f, &v->draw_ops)) return 0;
@@ -278,6 +279,7 @@ int cv1k_load_state(struct cv1k_machine *m, const char *path)
     char magic[8];
     cv1k_u32 model;
     cv1k_u32 size;
+    cv1k_u32 i;
     f = fopen(path, "rb");
     if (f == NULL) return 0;
     if (!read_block(f, magic, 8UL)) { fclose(f); return 0; }
@@ -318,6 +320,8 @@ int cv1k_load_state(struct cv1k_machine *m, const char *path)
     if (!read_u32(f, &m->frames) || !read_u32(f, &m->dma_transfers) || !read_u32(f, &m->dma_bytes)) { fclose(f); return 0; }
     if (!read_u32(f, &m->dma_cache_invalidations)) { fclose(f); return 0; }
     if (!read_block(f, m->dma_timer_active, (cv1k_u32)sizeof(m->dma_timer_active))) { fclose(f); return 0; }
+    m->dma_timer_mask = 0UL;
+    for (i = 0; i < 4; i++) if (m->dma_timer_active[i] != 0UL) m->dma_timer_mask |= (1UL << (cv1k_u32)i);
     if (!read_block(f, m->dma_timer_due, (cv1k_u32)sizeof(m->dma_timer_due))) { fclose(f); return 0; }
     if (!read_block(f, m->dma_timer_chcr, (cv1k_u32)sizeof(m->dma_timer_chcr))) { fclose(f); return 0; }
     if (!read_block(f, m->dma_timer_base, (cv1k_u32)sizeof(m->dma_timer_base))) { fclose(f); return 0; }
