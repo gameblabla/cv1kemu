@@ -2,6 +2,7 @@
 #include "platform.h"
 #include "ui_tui.h"
 #include "ui_sdl3.h"
+#include "ui_sdl12.h"
 #include "savestate.h"
 #include "romset.h"
 #include <stdio.h>
@@ -18,7 +19,7 @@ struct input_script_event {
 
 static void usage(void)
 {
-    printf("cv1k-sandbox v50 ANSI C / SDL3-targeted emulator scaffold\n");
+    printf("cv1k-sandbox v53 ANSI C / SDL 1.2 audio-video-input frontend\n");
     printf("usage: cv1k_sandbox [options]\n");
     printf("  --model b|d           choose CV1000-B or CV1000-D RAM map\n");
     printf("  --romset path         load ddpsdoj zip or extracted directory with u2/u4/u23/u24\n");
@@ -52,7 +53,8 @@ static void usage(void)
     printf("  --break-pc hex        step until PC reaches hex before optional trace/run\n");
     printf("  --break-max n         maximum instructions for --break-pc, default 10000000\n");
     printf("  --run-break-pc hex    run frame-clocked CPU until PC reaches hex\n");
-    printf("  --sdl                 run SDL3 frontend when compiled with make sdl3\n");
+    printf("  --sdl                 run the compiled SDL frontend, SDL 1.2 for make sdl12 or SDL3 for make sdl3\n");
+    printf("  --sdl12               run SDL 1.2 frontend when compiled with make sdl12\n");
     printf("  --probe-title         render ddpsdoj diagnostic/probe screen\n");
     printf("  --save-state file     save state after running\n");
     printf("  --load-state file     load state before running\n");
@@ -158,7 +160,7 @@ static void debug_frame_clocked_until(struct cv1k_machine *m, cv1k_u32 target_pc
             total++;
         }
         if (m->irq2_enabled) {
-            if (((cycles_before / 3332000UL) != (m->cpu.cycles / 3332000UL)) ||
+            if (((cycles_before / CV1K_CYCLES_PER_VBLANK) != (m->cpu.cycles / CV1K_CYCLES_PER_VBLANK)) ||
                 (speedup_did_tick && m->video.executed_ops != 0UL && ((m->mame_speedup_spins & 0x3ffUL) == 0UL))) {
                 cv1k_u16 iprc;
                 int irq_pri;
@@ -192,6 +194,7 @@ int main(int argc, char **argv)
     int i;
     int run_frames;
     int sdl_requested;
+    int sdl12_requested;
     int probe_requested;
     int trace_steps;
     int trace_fetch;
@@ -240,6 +243,7 @@ int main(int argc, char **argv)
     model = CV1K_MODEL_D;
     run_frames = -1;
     sdl_requested = 0;
+    sdl12_requested = 0;
     probe_requested = 0;
     trace_steps = 0;
     trace_fetch = 0;
@@ -287,6 +291,8 @@ int main(int argc, char **argv)
             else model = CV1K_MODEL_B;
         } else if (strcmp(argv[i], "--sdl") == 0) {
             sdl_requested = 1;
+        } else if (strcmp(argv[i], "--sdl12") == 0) {
+            sdl12_requested = 1;
         } else if (strcmp(argv[i], "--probe-title") == 0) {
             probe_requested = 1;
         }
@@ -452,6 +458,26 @@ int main(int argc, char **argv)
 
     if (load_state != NULL) {
         if (!cv1k_load_state(&m, load_state)) fprintf(stderr, "warning: state load failed: %s\n", load_state);
+        /* Loading a snapshot restores emulated machine state, but command-line
+         * execution controls are frontend/debug options.  Re-apply them after
+         * load so a saved title state can still be tested with the same
+         * MAME-derived cache, IRQ, speedup, and alias modes requested on the
+         * current command line.
+         */
+        m.irq2_enabled = irq2_enabled;
+        m.aggressive_boot_assists = aggressive_assists;
+        m.dcache_enabled = dcache_requested;
+        m.strict_cache_ops = strict_cache_ops;
+        m.mame_cache_meta = mame_cache_meta;
+        m.mame_trapa = mame_trapa;
+        m.mame_speedup = mame_speedup;
+        m.mame_full_dmatcr = mame_full_dmatcr;
+        m.mame_tmu_irq = mame_tmu_irq;
+        m.wide_p0_alias = wide_p0_alias;
+        m.compact_400_alias = compact_400_alias;
+        m.dma_cache_sync = dma_cache_sync;
+        m.vblank_irq_and_tick = vblank_irq_and_tick;
+        cv1k_nand_set_data_only_reads(&m.nand, nand_data_only);
     }
 
     if (run_break_requested) {
@@ -499,12 +525,17 @@ int main(int argc, char **argv)
         cv1k_machine_render_probe(&m, l1, l2, l3);
     }
 
-    if (sdl_requested) {
+    if (sdl_requested || sdl12_requested) {
         if (have_report) {
             compact_line(&rr, l1, l2, l3);
             cv1k_machine_render_probe(&m, l1, l2, l3);
         }
-        cv1k_ui_sdl3_run(&m);
+#ifdef CV1K_DEFAULT_SDL12
+        cv1k_ui_sdl12_run(&m);
+#else
+        if (sdl12_requested) cv1k_ui_sdl12_run(&m);
+        else cv1k_ui_sdl3_run(&m);
+#endif
     } else if (run_frames >= 0) {
         for (i = 0; i < run_frames; i++) {
             apply_input_script(&m.input, input_script, input_script_count, i);

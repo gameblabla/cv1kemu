@@ -134,6 +134,8 @@ struct cv1k_machine {
     cv1k_u32 auto_blits;
     cv1k_u32 auto_blit_last_base;
     cv1k_u32 auto_blit_last_end;
+    cv1k_u32 auto_blit_last_sig;
+    cv1k_u32 auto_blit_skips;
 };
 
 int cv1k_machine_init(struct cv1k_machine *m, int model);

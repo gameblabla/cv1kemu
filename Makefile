@@ -1,10 +1,15 @@
 CC ?= cc
+CXX ?= c++
 CFLAGS ?= -std=c89 -pedantic -Wall -Wextra -O2
+CXXFLAGS ?= -std=c++11 -Wall -Wextra -O2
 LDFLAGS ?=
 ZLIB_CFLAGS ?= $(shell pkg-config --cflags zlib 2>/dev/null)
 ZLIB_LIBS ?= $(shell pkg-config --libs zlib 2>/dev/null || echo -lz)
 SDL3_CFLAGS ?= $(shell pkg-config --cflags sdl3 2>/dev/null)
 SDL3_LIBS ?= $(shell pkg-config --libs sdl3 2>/dev/null)
+SDL12_CONFIG ?= sdl-config
+SDL12_CFLAGS ?= $(shell $(SDL12_CONFIG) --cflags 2>/dev/null)
+SDL12_LIBS ?= $(shell $(SDL12_CONFIG) --libs 2>/dev/null)
 
 BASE_SRC = \
  src/main.c \
@@ -22,12 +27,18 @@ BASE_SRC = \
  src/romset.c \
  src/ui_tui.c
 
-NO_SDL_SRC = $(BASE_SRC) src/ui_sdl3.c
-SDL_SRC = $(BASE_SRC) src/ui_sdl3.c
+NO_SDL_SRC = $(BASE_SRC) src/ui_sdl3.c src/ui_sdl12.c
+SDL3_SRC = $(BASE_SRC) src/ui_sdl3.c src/ui_sdl12.c
+SDL12_C_SRC = $(BASE_SRC) src/ui_sdl3.c src/ui_sdl12.c
+SDL12_CPP_SRC = src/mame_mpeg_audio.cpp src/ymz770_mame_audio.cpp
+
 OBJ = $(NO_SDL_SRC:.c=.o)
-SDL_OBJ = $(SDL_SRC:.c=.sdl3.o)
+SDL3_OBJ = $(SDL3_SRC:.c=.sdl3.o)
+SDL12_C_OBJ = $(SDL12_C_SRC:.c=.sdl12.o)
+SDL12_CPP_OBJ = $(SDL12_CPP_SRC:.cpp=.sdl12.o)
 BIN = cv1k_sandbox
-SDL_BIN = cv1k_sandbox_sdl3
+SDL3_BIN = cv1k_sandbox_sdl3
+SDL12_BIN = cv1k_sandbox_sdl12
 
 all: $(BIN)
 
@@ -40,13 +51,24 @@ $(BIN): $(OBJ)
 %.sdl3.o: %.c
 	$(CC) $(CFLAGS) $(ZLIB_CFLAGS) $(SDL3_CFLAGS) -DCV1K_WITH_ZLIB -DCV1K_WITH_SDL3 -Isrc -c $< -o $@
 
-sdl3: $(SDL_BIN)
+sdl3: $(SDL3_BIN)
 
-$(SDL_BIN): $(SDL_OBJ)
-	$(CC) $(CFLAGS) -o $@ $(SDL_OBJ) $(LDFLAGS) $(ZLIB_LIBS) $(SDL3_LIBS)
+$(SDL3_BIN): $(SDL3_OBJ)
+	$(CC) $(CFLAGS) -o $@ $(SDL3_OBJ) $(LDFLAGS) $(ZLIB_LIBS) $(SDL3_LIBS)
+
+%.sdl12.o: %.c
+	$(CC) $(CFLAGS) $(ZLIB_CFLAGS) $(SDL12_CFLAGS) -DCV1K_WITH_ZLIB -DCV1K_WITH_SDL12 -DCV1K_DEFAULT_SDL12 -Isrc -c $< -o $@
+
+%.sdl12.o: %.cpp
+	$(CXX) $(CXXFLAGS) $(SDL12_CFLAGS) -DCV1K_WITH_ZLIB -DCV1K_WITH_SDL12 -DCV1K_DEFAULT_SDL12 -Isrc -c $< -o $@
+
+sdl12: $(SDL12_BIN)
+
+$(SDL12_BIN): $(SDL12_C_OBJ) $(SDL12_CPP_OBJ)
+	$(CXX) $(CXXFLAGS) -o $@ $(SDL12_C_OBJ) $(SDL12_CPP_OBJ) $(LDFLAGS) $(ZLIB_LIBS) $(SDL12_LIBS)
 
 clean:
-	rm -f $(OBJ) $(SDL_OBJ) $(BIN) $(SDL_BIN) tools/mk_dummy_boot tools/mk_blit_demo dummy_u4.bin frame.ppm demo_ram.bin blit_demo.ppm test.ss ddpsdoj_probe.ppm quick.sav
+	rm -f $(OBJ) $(SDL3_OBJ) $(SDL12_C_OBJ) $(SDL12_CPP_OBJ) $(BIN) $(SDL3_BIN) $(SDL12_BIN) tools/mk_dummy_boot tools/mk_blit_demo dummy_u4.bin frame.ppm demo_ram.bin blit_demo.ppm test.ss ddpsdoj_probe.ppm quick.sav
 
 run-dummy: $(BIN) tools/mk_dummy_boot
 	./tools/mk_dummy_boot dummy_u4.bin

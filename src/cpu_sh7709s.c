@@ -78,11 +78,12 @@ static cv1k_u32 read_pc_rel32(struct cv1k_bus *bus, cv1k_u32 pc, cv1k_u32 disp)
     cv1k_u32 hi;
     cv1k_u32 lo;
     ea = ((pc + 4UL) & 0xfffffffcUL) + disp * 4UL;
-    /* Literal pools sit beside copied RAM code on CV1000.  Use the same
-     * fetch-side cache model as instruction words so a DMA overlay does not
-     * immediately destroy literals already resident in the SH cache. */
-    hi = (cv1k_u32)cv1k_bus_fetch16(bus, ea);
-    lo = (cv1k_u32)cv1k_bus_fetch16(bus, ea + 2UL);
+    /* MOV.L @(disp,PC),Rn is a data-side read, not an instruction fetch.
+     * MAME's SH7709S core routes this through the program data space and lets
+     * the cache/MMU layer decide visibility; do not force the opcode-cache
+     * lookup used for instruction words. */
+    hi = (cv1k_u32)cv1k_bus_read16(bus, ea);
+    lo = (cv1k_u32)cv1k_bus_read16(bus, ea + 2UL);
     return (hi << 16) | lo;
 }
 
@@ -90,13 +91,17 @@ static cv1k_u16 read_pc_rel16(struct cv1k_bus *bus, cv1k_u32 pc, cv1k_u32 disp)
 {
     cv1k_u32 base;
     base = pc + 4UL;
-    return cv1k_bus_fetch16(bus, base + disp * 2UL);
+    return cv1k_bus_read16(bus, base + disp * 2UL);
 }
 
 static void delay_slot(struct sh7709s_cpu *cpu, struct cv1k_bus *bus, cv1k_u32 slot_pc, cv1k_u32 target)
 {
+    cv1k_u32 old_guard;
+    old_guard = cpu->irq_delay_slot_guard;
+    cpu->irq_delay_slot_guard = old_guard + 1UL;
     cpu->pc = slot_pc & 0xfffffffeUL;
     sh7709s_step(cpu, bus);
+    cpu->irq_delay_slot_guard = old_guard;
     cpu->pc = target & 0xfffffffeUL;
 }
 
@@ -109,8 +114,12 @@ static void rte_delay_slot_then_restore(struct sh7709s_cpu *cpu, struct cv1k_bus
      * state at the wrong time.  Read SPC/SSR after the slot, matching MAME's
      * generated path where generate_delay_slot() precedes the RTE helper.
      */
+    cv1k_u32 old_guard;
+    old_guard = cpu->irq_delay_slot_guard;
+    cpu->irq_delay_slot_guard = old_guard + 1UL;
     cpu->pc = slot_pc & 0xfffffffeUL;
     sh7709s_step(cpu, bus);
+    cpu->irq_delay_slot_guard = old_guard;
     set_sr_full(cpu, cpu->ssr);
     cpu->pc = cpu->spc & 0xfffffffeUL;
 }
@@ -286,15 +295,13 @@ int sh7709s_step(struct sh7709s_cpu *cpu, struct cv1k_bus *bus)
     cv1k_u32 ea;
     cv1k_u32 imm;
     cv1k_u32 target;
-    cv1k_s32 ss;
-
     if (cpu->halted != 0UL) {
         cpu->cycles += 1UL;
-        do_irq_if_possible(cpu, bus);
+        if (cpu->irq_delay_slot_guard == 0UL) do_irq_if_possible(cpu, bus);
         return 1;
     }
 
-    if (do_irq_if_possible(cpu, bus)) {
+    if (cpu->irq_delay_slot_guard == 0UL && do_irq_if_possible(cpu, bus)) {
         cpu->cycles += 8UL;
         return 1;
     }

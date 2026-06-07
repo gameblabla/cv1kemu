@@ -105,7 +105,16 @@ static void ymz770_internal_reg_write(struct cv1k_ymz770 *ymz, cv1k_u8 reg, cv1k
 
 void cv1k_ymz770_reset(struct cv1k_ymz770 *ymz)
 {
+    cv1k_u32 i;
     memset(ymz, 0, sizeof(*ymz));
+    /* MAME ymz770_device::device_reset() starts playback pan centered.
+     * Volume remains zero until the game writes the channel volume register.
+     */
+    for (i = 0UL; i < CV1K_YMZ770_CHANNELS; i++) {
+        ymz->channels[i].pan = 64U;
+        ymz->channels[i].volume = 0UL;
+        ymz->channels[i].volume2 = 0U;
+    }
 }
 
 void cv1k_ymz770_write(struct cv1k_ymz770 *ymz, cv1k_u32 offset, cv1k_u8 data)

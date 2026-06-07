@@ -30,6 +30,7 @@ struct sh7709s_cpu {
     cv1k_u32 exception_count;
     cv1k_u32 last_illegal_pc;
     cv1k_u32 last_illegal_op;
+    cv1k_u32 irq_delay_slot_guard;
 };
 
 void sh7709s_reset(struct sh7709s_cpu *cpu);

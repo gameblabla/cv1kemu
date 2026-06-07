@@ -28,9 +28,12 @@ static cv1k_u32 rgb1555_to_rgb888(cv1k_u16 p)
     r = (cv1k_u32)((p >> 10) & 0x1fU);
     g = (cv1k_u32)((p >> 5) & 0x1fU);
     b = (cv1k_u32)(p & 0x1fU);
-    r = (r << 3) | (r >> 2);
-    g = (g << 3) | (g >> 2);
-    b = (b << 3) | (b >> 2);
+    /* MAME clr_t::to_pen() shifts 5-bit channels to the high bits only;
+     * it does not replicate the low bits as a generic RGB555 converter would.
+     */
+    r = r << 3;
+    g = g << 3;
+    b = b << 3;
     return (r << 16) | (g << 8) | b;
 }
 
@@ -59,66 +62,203 @@ static cv1k_u16 apply_tint(cv1k_u16 src, cv1k_u8 mul_r, cv1k_u8 mul_g, cv1k_u8 m
     return make1555(r, g, b, a);
 }
 
-static cv1k_u8 dst_mode_component(cv1k_u8 s, cv1k_u8 d, cv1k_u8 alpha, int mode)
+struct cv1k_clr5 {
+    cv1k_u8 r;
+    cv1k_u8 g;
+    cv1k_u8 b;
+};
+
+static struct cv1k_clr5 clr5_make(cv1k_u8 r, cv1k_u8 g, cv1k_u8 b)
 {
-    switch (mode & 7) {
-    case 0: return cv1k_mame_mul5(d, alpha);
-    case 1: return cv1k_mame_mul5(s, d);
-    case 2: return cv1k_mame_mul5(d, d);
-    case 4: return cv1k_mame_mul5_rev(alpha, d);
-    case 5: return cv1k_mame_mul5_rev(s, d);
-    case 6: return cv1k_mame_mul5_rev(d, d);
-    default: return d;
+    struct cv1k_clr5 c;
+    c.r = (cv1k_u8)(r & 0x1fU);
+    c.g = (cv1k_u8)(g & 0x1fU);
+    c.b = (cv1k_u8)(b & 0x1fU);
+    return c;
+}
+
+static struct cv1k_clr5 clr5_from1555(cv1k_u16 p)
+{
+    return clr5_make((cv1k_u8)((p >> 10) & 0x1fU), (cv1k_u8)((p >> 5) & 0x1fU), (cv1k_u8)(p & 0x1fU));
+}
+
+static struct cv1k_clr5 clr5_add(struct cv1k_clr5 a, struct cv1k_clr5 b)
+{
+    return clr5_make(cv1k_mame_add5(a.r, b.r), cv1k_mame_add5(a.g, b.g), cv1k_mame_add5(a.b, b.b));
+}
+
+static struct cv1k_clr5 clr5_mul_fixed(cv1k_u8 v, struct cv1k_clr5 c)
+{
+    return clr5_make(cv1k_mame_mul5(v, c.r), cv1k_mame_mul5(v, c.g), cv1k_mame_mul5(v, c.b));
+}
+
+static struct cv1k_clr5 clr5_mul_fixed_rev(cv1k_u8 v, struct cv1k_clr5 c)
+{
+    return clr5_make(cv1k_mame_mul5_rev(v, c.r), cv1k_mame_mul5_rev(v, c.g), cv1k_mame_mul5_rev(v, c.b));
+}
+
+static struct cv1k_clr5 clr5_square(struct cv1k_clr5 c)
+{
+    return clr5_make(cv1k_mame_mul5(c.r, c.r), cv1k_mame_mul5(c.g, c.g), cv1k_mame_mul5(c.b, c.b));
+}
+
+static struct cv1k_clr5 clr5_mul_3param(struct cv1k_clr5 a, struct cv1k_clr5 b)
+{
+    /* MAME clr_t::mul_3param(clr1, clr2): table[clr2][clr1]. */
+    return clr5_make(cv1k_mame_mul5(b.r, a.r), cv1k_mame_mul5(b.g, a.g), cv1k_mame_mul5(b.b, a.b));
+}
+
+static struct cv1k_clr5 clr5_mul_rev_square(struct cv1k_clr5 c)
+{
+    return clr5_make(cv1k_mame_mul5_rev(c.r, c.r), cv1k_mame_mul5_rev(c.g, c.g), cv1k_mame_mul5_rev(c.b, c.b));
+}
+
+static struct cv1k_clr5 clr5_mul_rev_3param(struct cv1k_clr5 a, struct cv1k_clr5 b)
+{
+    /* MAME clr_t::mul_rev_3param(clr1, clr2): rev_table[clr2][clr1]. */
+    return clr5_make(cv1k_mame_mul5_rev(b.r, a.r), cv1k_mame_mul5_rev(b.g, a.g), cv1k_mame_mul5_rev(b.b, a.b));
+}
+
+static struct cv1k_clr5 clr5_add_dst_mode(struct cv1k_clr5 left, struct cv1k_clr5 src, struct cv1k_clr5 dst, cv1k_u8 dst_alpha, int dst_mode)
+{
+    struct cv1k_clr5 right;
+    switch (dst_mode & 7) {
+    case 0:
+        /* Generic MAME add_with_clr_mul_fixed() uses table[dst][alpha],
+         * unlike clr_t::mul_fixed() which uses table[alpha][src].
+         */
+        right = clr5_make(cv1k_mame_mul5(dst.r, dst_alpha), cv1k_mame_mul5(dst.g, dst_alpha), cv1k_mame_mul5(dst.b, dst_alpha));
+        return clr5_add(left, right);
+    case 1:
+        right = clr5_mul_3param(dst, src);
+        return clr5_add(left, right);
+    case 2:
+        /* Preserve MAME's exact add_with_clr_square behaviour.  The MAME
+         * helper uses clr0.r as the first addend for all three channels.
+         */
+        return clr5_make(
+            cv1k_mame_add5(left.r, cv1k_mame_mul5(dst.r, dst.r)),
+            cv1k_mame_add5(left.r, cv1k_mame_mul5(dst.g, dst.g)),
+            cv1k_mame_add5(left.r, cv1k_mame_mul5(dst.b, dst.b)));
+    case 3:
+        return clr5_add(left, dst);
+    case 4:
+        right = clr5_mul_fixed_rev(dst_alpha, dst);
+        return clr5_add(left, right);
+    case 5:
+        right = clr5_mul_rev_3param(dst, src);
+        return clr5_add(left, right);
+    case 6:
+        right = clr5_mul_rev_square(dst);
+        return clr5_add(left, right);
+    default:
+        return clr5_add(left, dst);
     }
 }
 
-static cv1k_u8 blend_component_mame(cv1k_u8 s, cv1k_u8 d, cv1k_u8 src_alpha, cv1k_u8 dst_alpha, int src_mode, int dst_mode)
+static struct cv1k_clr5 clr5_blend_smode0(struct cv1k_clr5 s, struct cv1k_clr5 d, cv1k_u8 src_alpha, cv1k_u8 dst_alpha, int dst_mode)
 {
-    cv1k_u8 left;
-    cv1k_u8 right;
-    if ((src_mode & 7) == 0) {
-        left = cv1k_mame_mul5(s, src_alpha);
-        right = dst_mode_component(s, d, dst_alpha, dst_mode);
-        return cv1k_mame_add5(left, right);
+    struct cv1k_clr5 left;
+    switch (dst_mode & 7) {
+    case 0:
+        return clr5_make(
+            cv1k_mame_add5(cv1k_mame_mul5(src_alpha, s.r), cv1k_mame_mul5(dst_alpha, d.r)),
+            cv1k_mame_add5(cv1k_mame_mul5(src_alpha, s.g), cv1k_mame_mul5(dst_alpha, d.g)),
+            cv1k_mame_add5(cv1k_mame_mul5(src_alpha, s.b), cv1k_mame_mul5(dst_alpha, d.b)));
+    case 1:
+        return clr5_make(
+            cv1k_mame_add5(cv1k_mame_mul5(src_alpha, s.r), cv1k_mame_mul5(s.r, d.r)),
+            cv1k_mame_add5(cv1k_mame_mul5(src_alpha, s.g), cv1k_mame_mul5(s.g, d.g)),
+            cv1k_mame_add5(cv1k_mame_mul5(src_alpha, s.b), cv1k_mame_mul5(s.b, d.b)));
+    case 2:
+    case 3:
+    case 4:
+    case 6:
+    case 7:
+        left = clr5_mul_fixed(src_alpha, s);
+        return clr5_add_dst_mode(left, s, d, dst_alpha, dst_mode);
+    case 5:
+        return clr5_make(
+            cv1k_mame_add5(cv1k_mame_mul5(src_alpha, s.r), cv1k_mame_mul5_rev(s.r, d.r)),
+            cv1k_mame_add5(cv1k_mame_mul5(src_alpha, s.g), cv1k_mame_mul5_rev(s.g, d.g)),
+            cv1k_mame_add5(cv1k_mame_mul5(src_alpha, s.b), cv1k_mame_mul5_rev(s.b, d.b)));
+    default:
+        left = clr5_mul_fixed(src_alpha, s);
+        return clr5_add(left, d);
     }
-    if ((src_mode & 7) == 2) {
-        left = cv1k_mame_mul5(d, s);
-        if ((dst_mode & 7) == 0) right = cv1k_mame_mul5(d, dst_alpha);
-        else right = dst_mode_component(s, d, dst_alpha, dst_mode);
-        return cv1k_mame_add5(left, right);
+}
+
+static struct cv1k_clr5 clr5_blend_smode2(struct cv1k_clr5 s, struct cv1k_clr5 d, cv1k_u8 dst_alpha, int dst_mode)
+{
+    struct cv1k_clr5 left;
+    switch (dst_mode & 7) {
+    case 0:
+        return clr5_make(
+            cv1k_mame_add5(cv1k_mame_mul5(d.r, s.r), cv1k_mame_mul5(dst_alpha, d.r)),
+            cv1k_mame_add5(cv1k_mame_mul5(d.g, s.g), cv1k_mame_mul5(dst_alpha, d.g)),
+            cv1k_mame_add5(cv1k_mame_mul5(d.b, s.b), cv1k_mame_mul5(dst_alpha, d.b)));
+    case 1:
+    case 2:
+    case 3:
+    case 4:
+    case 5:
+    case 6:
+    case 7:
+        left = clr5_mul_3param(s, d);
+        return clr5_add_dst_mode(left, s, d, dst_alpha, dst_mode);
+    default:
+        left = clr5_mul_3param(s, d);
+        return clr5_add(left, d);
     }
-    switch (src_mode & 7) {
-    case 1: left = cv1k_mame_mul5(s, s); break;
-    case 4: left = cv1k_mame_mul5_rev(src_alpha, s); break;
-    case 5: left = cv1k_mame_mul5_rev(s, s); break;
-    case 6: left = cv1k_mame_mul5_rev(d, s); break;
-    default: left = s; break;
-    }
-    right = dst_mode_component(s, d, dst_alpha, dst_mode);
-    return cv1k_mame_add5(left, right);
 }
 
 static cv1k_u16 blend_pixel(cv1k_u16 src, cv1k_u16 dst, cv1k_u8 src_alpha, cv1k_u8 dst_alpha, int src_mode, int dst_mode)
 {
-    cv1k_u8 sr;
-    cv1k_u8 sg;
-    cv1k_u8 sb;
-    cv1k_u8 dr;
-    cv1k_u8 dg;
-    cv1k_u8 db;
-    cv1k_u8 rr;
-    cv1k_u8 rg;
-    cv1k_u8 rb;
-    sr = (cv1k_u8)((src >> 10) & 0x1fU);
-    sg = (cv1k_u8)((src >> 5) & 0x1fU);
-    sb = (cv1k_u8)(src & 0x1fU);
-    dr = (cv1k_u8)((dst >> 10) & 0x1fU);
-    dg = (cv1k_u8)((dst >> 5) & 0x1fU);
-    db = (cv1k_u8)(dst & 0x1fU);
-    rr = blend_component_mame(sr, dr, src_alpha, dst_alpha, src_mode, dst_mode);
-    rg = blend_component_mame(sg, dg, src_alpha, dst_alpha, src_mode, dst_mode);
-    rb = blend_component_mame(sb, db, src_alpha, dst_alpha, src_mode, dst_mode);
-    return make1555(rr, rg, rb, 1U);
+    struct cv1k_clr5 s;
+    struct cv1k_clr5 d;
+    struct cv1k_clr5 left;
+    struct cv1k_clr5 out;
+    s = clr5_from1555(src);
+    d = clr5_from1555(dst);
+
+    /* ANSI C translation of MAME cv1k_v_pixel.ipp.  Source modes 0 and 2
+     * have hand-specialized destination terms in MAME; handling them through
+     * the generic left+destination helper produces wrong colors for several
+     * title/menu fade and highlight effects.
+     */
+    switch (src_mode & 7) {
+    case 0:
+        out = clr5_blend_smode0(s, d, src_alpha, dst_alpha, dst_mode);
+        break;
+    case 1:
+        left = clr5_square(s);
+        out = clr5_add_dst_mode(left, s, d, dst_alpha, dst_mode);
+        break;
+    case 2:
+        out = clr5_blend_smode2(s, d, dst_alpha, dst_mode);
+        break;
+    case 3:
+        left = s;
+        out = clr5_add_dst_mode(left, s, d, dst_alpha, dst_mode);
+        break;
+    case 4:
+        left = clr5_mul_fixed_rev(src_alpha, s);
+        out = clr5_add_dst_mode(left, s, d, dst_alpha, dst_mode);
+        break;
+    case 5:
+        left = clr5_mul_rev_square(s);
+        out = clr5_add_dst_mode(left, s, d, dst_alpha, dst_mode);
+        break;
+    case 6:
+        left = clr5_mul_rev_3param(s, d);
+        out = clr5_add_dst_mode(left, s, d, dst_alpha, dst_mode);
+        break;
+    default:
+        left = s;
+        out = clr5_add_dst_mode(left, s, d, dst_alpha, dst_mode);
+        break;
+    }
+    return (cv1k_u16)((src & 0x8000U) | (cv1k_u16)((cv1k_u16)out.r << 10) | (cv1k_u16)((cv1k_u16)out.g << 5) | (cv1k_u16)out.b);
 }
 
 static cv1k_u16 read_ram16(const cv1k_u8 *ram, cv1k_u32 ram_size, cv1k_u32 addr)
@@ -183,6 +323,7 @@ void cv1k_video_reset(struct cv1k_video *video)
     video->clip_ops = 0UL;
     video->last_unknown_op = 0UL;
     video->busy_cycles_ns = 0UL;
+    video->busy_cycles_left = 0UL;
     video->blit_idle_op_bytes = 0UL;
     video->blit_hline_penalty_ns = 0UL;
     video->blit_over_frame_count = 0UL;
@@ -193,6 +334,8 @@ void cv1k_video_reset(struct cv1k_video *video)
     video->clip_w = CV1K_SCREEN_W;
     video->clip_h = CV1K_SCREEN_H;
     video->last_list_addr = 0UL;
+    video->mmio_execs = 0UL;
+    video->last_mmio_list_addr = 0UL;
     video->last_upload_addr = 0UL;
     video->last_upload_x = 0UL;
     video->last_upload_y = 0UL;
@@ -218,6 +361,7 @@ void cv1k_video_reset(struct cv1k_video *video)
     video->draw_written_nonzero_total = 0UL;
     video->last_frame_nonzero = 0UL;
     video->busy = 0U;
+    video->busy_cycles_left = 0UL;
     video->fpga_firmware_pos = 0UL;
     video->fpga_firmware_checksum = 0UL;
     video->fpga_firmware_done = 0UL;
@@ -270,7 +414,7 @@ static cv1k_u32 cv1k_video_read32_mame(const struct cv1k_video *video, cv1k_u32 
      * a v27 scaffold convenience, but it is not MAME-compatible.
      */
     switch (regoff & ~3UL) {
-    case 0x10UL: return video->busy ? 0x00000000UL : 0x00000010UL;
+    case 0x10UL: return (video->busy || video->busy_cycles_left != 0UL) ? 0x00000000UL : 0x00000010UL;
     case 0x24UL: return 0xffffffffUL;
     case 0x28UL: return 0xffffffffUL;
     case 0x50UL: return 0xfffffff0UL;
@@ -294,21 +438,27 @@ cv1k_u8 cv1k_video_read8(struct cv1k_video *video, cv1k_u32 offset)
 
 static void set_exec_clip_from_regs(struct cv1k_video *video)
 {
-    /* MAME resets the active clip at the start of both shadow-copy and
-     * execution passes from the shadowed 0x40/0x44 clip registers, expanded
-     * by the 32-pixel CV1000 margin.  Keep the coordinates saturating for the
-     * ANSI C VRAM array instead of allowing unsigned underflow.
+    /* MAME stores the draw clip as a signed rectangle: origin - 32 through
+     * origin + visible_size - 1 + 32.  Do not clamp the left/top edge here;
+     * off-VRAM writes are discarded later by the renderer, but a negative clip
+     * origin changes which source pixels survive at the visible edge.
      */
     cv1k_u32 x;
     cv1k_u32 y;
+    cv1k_s32 min_x;
+    cv1k_s32 min_y;
+    cv1k_s32 max_x;
+    cv1k_s32 max_y;
     x = video->regs[0x40UL >> 2] & 0x1fffUL;
     y = video->regs[0x44UL >> 2] & 0x0fffUL;
-    video->clip_x = (x >= CV1K_CLIP_MARGIN) ? (x - CV1K_CLIP_MARGIN) : 0UL;
-    video->clip_y = (y >= CV1K_CLIP_MARGIN) ? (y - CV1K_CLIP_MARGIN) : 0UL;
-    video->clip_w = CV1K_SCREEN_W + (CV1K_CLIP_MARGIN * 2UL);
-    video->clip_h = CV1K_SCREEN_H + (CV1K_CLIP_MARGIN * 2UL);
-    if (video->clip_x + video->clip_w > CV1K_VRAM_W) video->clip_w = CV1K_VRAM_W - video->clip_x;
-    if (video->clip_y + video->clip_h > CV1K_VRAM_H) video->clip_h = CV1K_VRAM_H - video->clip_y;
+    min_x = (cv1k_s32)x - (cv1k_s32)CV1K_CLIP_MARGIN;
+    min_y = (cv1k_s32)y - (cv1k_s32)CV1K_CLIP_MARGIN;
+    max_x = (cv1k_s32)x + (cv1k_s32)CV1K_SCREEN_W - 1 + (cv1k_s32)CV1K_CLIP_MARGIN;
+    max_y = (cv1k_s32)y + (cv1k_s32)CV1K_SCREEN_H - 1 + (cv1k_s32)CV1K_CLIP_MARGIN;
+    video->clip_x = min_x;
+    video->clip_y = min_y;
+    video->clip_w = max_x - min_x + 1;
+    video->clip_h = max_y - min_y + 1;
 }
 
 static void idle_blitter_mame(struct cv1k_video *video, cv1k_u32 operation_size_bytes);
@@ -326,10 +476,10 @@ static void apply_clip_command(struct cv1k_video *video, cv1k_u16 cliptype)
     if (cliptype != 0U) {
         set_exec_clip_from_regs(video);
     } else {
-        video->clip_x = 0UL;
-        video->clip_y = 0UL;
-        video->clip_w = CV1K_VRAM_W;
-        video->clip_h = CV1K_VRAM_H;
+        video->clip_x = 0;
+        video->clip_y = 0;
+        video->clip_w = (cv1k_s32)CV1K_VRAM_W;
+        video->clip_h = (cv1k_s32)CV1K_VRAM_H;
     }
     video->clip_ops++;
     idle_blitter_mame(video, CV1K_CLIP_OPERATION_SIZE_BYTES);
@@ -405,8 +555,6 @@ static cv1k_u32 execute_upload(struct cv1k_video *video, cv1k_u32 addr, const cv
     h = (cv1k_u32)(read_ram16(ram, ram_size, addr + 14UL) & 0x0fffU) + 1UL;
     pos = addr + CV1K_UPLOAD_HEADER_SIZE_BYTES;
     nonzero = 0UL;
-    if (w > CV1K_VRAM_W) w = CV1K_VRAM_W;
-    if (h > CV1K_VRAM_H) h = CV1K_VRAM_H;
     video->last_upload_addr = addr;
     video->last_upload_x = dst_x;
     video->last_upload_y = dst_y;
@@ -418,7 +566,18 @@ static cv1k_u32 execute_upload(struct cv1k_video *video, cv1k_u32 addr, const cv
             pen = read_ram16(ram, ram_size, pos);
             pos += 2UL;
             if ((pen & 0x7fffU) != 0U) nonzero++;
-            if (video->vram1555 != NULL) video->vram1555[vram_index(dst_x + px, dst_y + py)] = pen;
+            /* MAME's gfx_upload() masks the starting co-ordinates but then
+             * writes through a linear bitmap row pointer.  It does not
+             * wrap each uploaded pixel through the source/draw VRAM indexer.
+             * The sandbox's earlier per-pixel vram_index() wrap could smear
+             * over-edge upload data into the top-left atlas/title pages and
+             * amplify stale list replays into visible corruption.
+             */
+            if (video->vram1555 != NULL && dst_y + py < CV1K_VRAM_H) {
+                cv1k_u32 dst_index;
+                dst_index = (dst_y + py) * CV1K_VRAM_W + dst_x + px;
+                if (dst_index < CV1K_VRAM_W * CV1K_VRAM_H) video->vram1555[dst_index] = pen;
+            }
         }
     }
     video->last_upload_nonzero = nonzero;
@@ -444,6 +603,7 @@ static cv1k_u32 execute_draw(struct cv1k_video *video, cv1k_u32 addr, const cv1k
     cv1k_u8 src_mode;
     cv1k_u8 dst_mode;
     int blend_enabled;
+    int tint_enabled;
     cv1k_u8 mul_r;
     cv1k_u8 mul_g;
     cv1k_u8 mul_b;
@@ -481,8 +641,24 @@ static cv1k_u32 execute_draw(struct cv1k_video *video, cv1k_u32 addr, const cv1k
     dst_mode = (cv1k_u8)(flags & 7U);
     blend_enabled = ((flags & 0x0200U) != 0U) ? 1 : 0;
     if (src_mode == 0U && src_alpha == 0x1fU && dst_mode == 4U && dst_alpha == 0x1fU) blend_enabled = 0;
+    tint_enabled = (((mul_r >> 2) != 0x20U) || ((mul_g >> 2) != 0x20U) || ((mul_b >> 2) != 0x20U)) ? 1 : 0;
     if (w > CV1K_VRAM_W) w = CV1K_VRAM_W;
     if (h > CV1K_VRAM_H) h = CV1K_VRAM_H;
+    if (w != 0UL) {
+        if ((flags & 0x0800U) != 0U) {
+            if ((src_x & 0x1fffUL) < ((src_x - (w - 1UL)) & 0x1fffUL)) {
+                idle_blitter_mame(video, CV1K_DRAW_OPERATION_SIZE_BYTES);
+                video->draw_ops++;
+                return addr + CV1K_DRAW_OPERATION_SIZE_BYTES;
+            }
+        } else {
+            if ((src_x & 0x1fffUL) > ((src_x + (w - 1UL)) & 0x1fffUL)) {
+                idle_blitter_mame(video, CV1K_DRAW_OPERATION_SIZE_BYTES);
+                video->draw_ops++;
+                return addr + CV1K_DRAW_OPERATION_SIZE_BYTES;
+            }
+        }
+    }
     video->last_draw_addr = addr;
     video->last_draw_flags = (cv1k_u32)flags;
     video->last_draw_alpha = (cv1k_u32)alphaw;
@@ -498,17 +674,17 @@ static cv1k_u32 execute_draw(struct cv1k_video *video, cv1k_u32 addr, const cv1k
     for (py = 0UL; py < h; py++) {
         sy = ((flags & 0x0400U) != 0U) ? (src_y + (h - 1UL - py)) : (src_y + py);
         dy = dst_y + (cv1k_s32)py;
-        if (dy < 0 || (cv1k_u32)dy >= CV1K_VRAM_H) continue;
+        if (dy >= (cv1k_s32)CV1K_VRAM_H) continue;
         for (px = 0UL; px < w; px++) {
             sx = ((flags & 0x0800U) != 0U) ? (src_x + (w - 1UL - px)) : (src_x + px);
             dx = dst_x + (cv1k_s32)px;
-            if (dx < 0 || (cv1k_u32)dx >= CV1K_VRAM_W) continue;
-            if ((cv1k_u32)dx < video->clip_x || (cv1k_u32)dy < video->clip_y) continue;
-            if ((cv1k_u32)dx >= video->clip_x + video->clip_w || (cv1k_u32)dy >= video->clip_y + video->clip_h) continue;
+            if (dx < video->clip_x || dy < video->clip_y) continue;
+            if (dx >= video->clip_x + video->clip_w || dy >= video->clip_y + video->clip_h) continue;
+            if (dx < 0 || (cv1k_u32)dx >= CV1K_VRAM_W || dy < 0 || (cv1k_u32)dy >= CV1K_VRAM_H) continue;
             src = video->vram1555[vram_index(sx, sy)];
             if ((src & 0x7fffU) != 0U) src_nonzero++;
             if ((flags & 0x0100U) != 0U && (src & 0x8000U) == 0U) continue;
-            src = apply_tint(src, mul_r, mul_g, mul_b);
+            if (tint_enabled) src = apply_tint(src, mul_r, mul_g, mul_b);
             if (blend_enabled) {
                 dst = video->vram1555[vram_index((cv1k_u32)dx, (cv1k_u32)dy)];
                 src = blend_pixel(src, dst, src_alpha, dst_alpha, (int)src_mode, (int)dst_mode);
@@ -531,21 +707,25 @@ static cv1k_u32 execute_draw(struct cv1k_video *video, cv1k_u32 addr, const cv1k
      */
     clipped_w = w;
     clipped_h = h;
-    if (dst_x < (cv1k_s32)video->clip_x) {
-        cv1k_u32 cut;
-        cut = video->clip_x - (cv1k_u32)dst_x;
-        clipped_w = (cut >= clipped_w) ? 0UL : (clipped_w - cut);
+    if (dst_x < video->clip_x) {
+        cv1k_s32 cut;
+        cut = video->clip_x - dst_x;
+        clipped_w = ((cv1k_u32)cut >= clipped_w) ? 0UL : (clipped_w - (cv1k_u32)cut);
     }
-    if (dst_y < (cv1k_s32)video->clip_y) {
-        cv1k_u32 cuty;
-        cuty = video->clip_y - (cv1k_u32)dst_y;
-        clipped_h = (cuty >= clipped_h) ? 0UL : (clipped_h - cuty);
+    if (dst_y < video->clip_y) {
+        cv1k_s32 cuty;
+        cuty = video->clip_y - dst_y;
+        clipped_h = ((cv1k_u32)cuty >= clipped_h) ? 0UL : (clipped_h - (cv1k_u32)cuty);
     }
-    if (dst_x >= 0 && (cv1k_u32)dst_x + clipped_w > video->clip_x + video->clip_w) {
-        clipped_w = ((cv1k_u32)dst_x >= video->clip_x + video->clip_w) ? 0UL : (video->clip_x + video->clip_w - (cv1k_u32)dst_x);
+    if ((cv1k_s32)(dst_x + (cv1k_s32)clipped_w) > video->clip_x + video->clip_w) {
+        cv1k_s32 right;
+        right = video->clip_x + video->clip_w;
+        clipped_w = (dst_x >= right) ? 0UL : (cv1k_u32)(right - dst_x);
     }
-    if (dst_y >= 0 && (cv1k_u32)dst_y + clipped_h > video->clip_y + video->clip_h) {
-        clipped_h = ((cv1k_u32)dst_y >= video->clip_y + video->clip_h) ? 0UL : (video->clip_y + video->clip_h - (cv1k_u32)dst_y);
+    if ((cv1k_s32)(dst_y + (cv1k_s32)clipped_h) > video->clip_y + video->clip_h) {
+        cv1k_s32 bottom;
+        bottom = video->clip_y + video->clip_h;
+        clipped_h = (dst_y >= bottom) ? 0UL : (cv1k_u32)(bottom - dst_y);
     }
     if (clipped_w == 0UL || clipped_h == 0UL) {
         idle_blitter_mame(video, CV1K_DRAW_OPERATION_SIZE_BYTES);
@@ -640,7 +820,33 @@ static void cv1k_video_execute_list_from(struct cv1k_video *video, cv1k_u32 addr
         addr %= ram_size;
     }
     finish_blit_delay_mame(video);
-    video->busy = 0U;
+    if (video->busy_cycles_ns != 0UL) {
+        double cyc_d;
+        cyc_d = ((double)video->busy_cycles_ns * (double)CV1K_CPU_CLOCK_HZ) / 1000000000.0;
+        if (cyc_d < 1.0) cyc_d = 1.0;
+        if (cyc_d > 4294967295.0) cyc_d = 4294967295.0;
+        video->busy_cycles_left = (cv1k_u32)cyc_d;
+        video->busy = 1U;
+    } else {
+        video->busy_cycles_left = 0UL;
+        video->busy = 0U;
+    }
+}
+
+void cv1k_video_tick_cycles(struct cv1k_video *video, cv1k_u32 cycles)
+{
+    if (video == NULL) return;
+    if (video->busy_cycles_left == 0UL) {
+        video->busy = 0U;
+        return;
+    }
+    if (cycles >= video->busy_cycles_left) {
+        video->busy_cycles_left = 0UL;
+        video->busy = 0U;
+    } else {
+        video->busy_cycles_left -= cycles;
+        video->busy = 1U;
+    }
 }
 
 static void cv1k_video_execute_list_common(struct cv1k_video *video, cv1k_u32 addr, cv1k_u32 end_addr, const cv1k_u8 *ram, cv1k_u32 ram_size, cv1k_u32 max_ops)
@@ -698,7 +904,15 @@ void cv1k_video_write8(struct cv1k_video *video, cv1k_u32 offset, cv1k_u8 data, 
      */
     if (regbase == 0x04UL && (offset & 3UL) == 3UL && (data & 0x01U) != 0U) {
         cv1k_u32 addr;
-        addr = video->regs[0x08UL >> 2] & 0x00ffffffUL;
+        /* MAME stores the full address in m_gfx_addr and masks it with
+         * 0x1fffffff at blit time.  The RAM reader then applies the main-RAM
+         * mask.  Preserve the full P1/P2/physical form here instead of
+         * forcing a local 24-bit offset; this keeps diagnostics and repeated
+         * launches aligned with cv1k_blitter_device::gfx_exec_w().
+         */
+        addr = video->regs[0x08UL >> 2] & 0x1fffffffUL;
+        video->mmio_execs++;
+        video->last_mmio_list_addr = addr;
         cv1k_video_execute_list(video, addr, ram, ram_size, 4096UL);
     } else if (regbase == 0x14UL || regbase == 0x18UL) {
         video->gfx_scroll_x = video->regs[0x14UL >> 2] & 0x1fffUL;

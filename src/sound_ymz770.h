@@ -3,6 +3,10 @@
 
 #include "cv1k_types.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define CV1K_YMZ770_FIFO_SIZE 256U
 #define CV1K_YMZ770_CHANNELS 8U
 #define CV1K_YMZ770_SEQUENCES 8U
@@ -53,5 +57,19 @@ struct cv1k_ymz770 {
 void cv1k_ymz770_reset(struct cv1k_ymz770 *ymz);
 void cv1k_ymz770_write(struct cv1k_ymz770 *ymz, cv1k_u32 offset, cv1k_u8 data);
 void cv1k_ymz770_mix_s16(struct cv1k_ymz770 *ymz, short *mono, cv1k_u32 samples);
+
+/* MAME-derived YMZ770C/AMM path used by the SDL 1.2 backend.  It is kept as
+ * a separate API so the existing ANSI C/headless build does not require C++.
+ * Output is interleaved signed 16-bit stereo at the YMZ770 sample clock.
+ */
+void cv1k_ymz770_mix_s16_stereo(struct cv1k_ymz770 *ymz,
+                                const cv1k_u8 *rom,
+                                cv1k_u32 rom_size,
+                                short *stereo,
+                                cv1k_u32 samples);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

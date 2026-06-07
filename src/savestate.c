@@ -145,7 +145,7 @@ static int save_video(FILE *f, struct cv1k_video *v)
     if (!write_u32(f, v->unknown_ops) || !write_u32(f, v->clip_ops) || !write_u32(f, v->last_unknown_op) || !write_u32(f, v->busy_cycles_ns)) return 0;
     if (!write_u32(f, v->blit_idle_op_bytes) || !write_u32(f, v->blit_hline_penalty_ns) || !write_u32(f, v->blit_over_frame_count)) return 0;
     if (!write_u32(f, v->gfx_scroll_x) || !write_u32(f, v->gfx_scroll_y)) return 0;
-    if (!write_u32(f, v->clip_x) || !write_u32(f, v->clip_y) || !write_u32(f, v->clip_w) || !write_u32(f, v->clip_h)) return 0;
+    if (!write_u32(f, (cv1k_u32)v->clip_x) || !write_u32(f, (cv1k_u32)v->clip_y) || !write_u32(f, (cv1k_u32)v->clip_w) || !write_u32(f, (cv1k_u32)v->clip_h)) return 0;
     if (!write_u32(f, (cv1k_u32)v->busy)) return 0;
     if (!write_u32(f, v->fpga_firmware_pos) || !write_u32(f, v->fpga_firmware_checksum) || !write_u32(f, v->fpga_firmware_done)) return 0;
     if (!write_u32(f, (cv1k_u32)v->fpga_firmware_version)) return 0;
@@ -166,7 +166,14 @@ static int load_video(FILE *f, struct cv1k_video *v)
     if (!read_u32(f, &v->unknown_ops) || !read_u32(f, &v->clip_ops) || !read_u32(f, &v->last_unknown_op) || !read_u32(f, &v->busy_cycles_ns)) return 0;
     if (!read_u32(f, &v->blit_idle_op_bytes) || !read_u32(f, &v->blit_hline_penalty_ns) || !read_u32(f, &v->blit_over_frame_count)) return 0;
     if (!read_u32(f, &v->gfx_scroll_x) || !read_u32(f, &v->gfx_scroll_y)) return 0;
-    if (!read_u32(f, &v->clip_x) || !read_u32(f, &v->clip_y) || !read_u32(f, &v->clip_w) || !read_u32(f, &v->clip_h)) return 0;
+    if (!read_u32(f, &tmp)) return 0;
+    v->clip_x = (cv1k_s32)tmp;
+    if (!read_u32(f, &tmp)) return 0;
+    v->clip_y = (cv1k_s32)tmp;
+    if (!read_u32(f, &tmp)) return 0;
+    v->clip_w = (cv1k_s32)tmp;
+    if (!read_u32(f, &tmp)) return 0;
+    v->clip_h = (cv1k_s32)tmp;
     if (!read_u32(f, &tmp)) return 0;
     v->busy = (cv1k_u8)tmp;
     if (!read_u32(f, &v->fpga_firmware_pos) || !read_u32(f, &v->fpga_firmware_checksum) || !read_u32(f, &v->fpga_firmware_done)) return 0;
@@ -176,6 +183,16 @@ static int load_video(FILE *f, struct cv1k_video *v)
     v->fpga_firmware_port = (cv1k_u8)tmp;
     if (!read_u32(f, &tmp)) return 0;
     v->fpga_firmware_byte = (cv1k_u8)tmp;
+    /* Older save states do not carry the v55 MMIO/visible-frame diagnostic
+     * fields.  Treat any state with prior blitter execution as already past
+     * the bootstrap fallback phase so loading a title-screen state cannot
+     * immediately replay a guessed DDPSDOJ RAM list over it.
+     */
+    if (v->executed_ops != 0UL) {
+        v->last_frame_nonzero = 1UL;
+        v->mmio_execs = 1UL;
+        v->last_mmio_list_addr = v->regs[0x08UL >> 2] & 0x1fffffffUL;
+    }
     return 1;
 }
 

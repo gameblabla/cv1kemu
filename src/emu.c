@@ -13,6 +13,7 @@
  */
 #include "emu.h"
 #include "platform.h"
+#include "mame_cv1k_derived.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -223,6 +224,8 @@ void cv1k_machine_reset(struct cv1k_machine *m)
     m->auto_blits = 0UL;
     m->auto_blit_last_base = 0UL;
     m->auto_blit_last_end = 0UL;
+    m->auto_blit_last_sig = 0UL;
+    m->auto_blit_skips = 0UL;
 }
 
 
@@ -302,7 +305,15 @@ static int cv1k_irq2_priority_from_iprc(const struct cv1k_machine *m)
 
 static int cv1k_mame_speedup_idle(const struct cv1k_machine *m)
 {
+    int ii;
     if (m == NULL || !m->mame_speedup) return 0;
+    /* MAME's spin_until_interrupt is safe because the scheduler still wakes the
+     * SH core on external events.  The standalone frame runner samples scripted
+     * and SDL inputs outside the CPU scheduler, so do not suppress execution
+     * while any JAMMA input is asserted; let the normal idle loop observe the
+     * next vblank/IRQ and poll ports with the live input state.
+     */
+    for (ii = 0; ii < CV1K_INPUT_COUNT; ii++) if (m->input.state[ii] != 0U) return 0;
     /* MAME cv1k_state::init_ddpdfk installs a read handler at 0x0c002310
      * with idlepc 0x0c1d1346.  When the handler observes this PC it calls
      * spin_until_interrupt(), allowing the 60.024 Hz vblank interrupt to
@@ -324,11 +335,8 @@ static void cv1k_synthetic_vblank_tick(struct cv1k_machine *m)
      * interrupt frame.
      */
     cv1k_u32 v;
-    cv1k_u32 step;
     v = cv1k_bus_read32(&m->bus, 0x0c002310UL);
-    step = 1UL;
-    if (m != NULL && m->mame_speedup && m->video.executed_ops != 0UL) step = 256UL;
-    cv1k_bus_write32(&m->bus, 0x0c002310UL, v + step);
+    cv1k_bus_write32(&m->bus, 0x0c002310UL, v + 1UL);
 }
 
 static int cv1k_work_ptr_to_offset(const struct cv1k_machine *m, cv1k_u32 ptr, cv1k_u32 *out)
@@ -352,6 +360,139 @@ static int cv1k_ram_read32_direct(const struct cv1k_machine *m, cv1k_u32 addr, c
     return 1;
 }
 
+static int cv1k_ram_read16_off_direct(const struct cv1k_machine *m, cv1k_u32 off, cv1k_u16 *out)
+{
+    if (m == NULL || out == NULL || m->main_ram == NULL) return 0;
+    if (off + 2UL > m->main_ram_size) return 0;
+    *out = cv1k_be16(&m->main_ram[off]);
+    return 1;
+}
+
+static int cv1k_ddpsdoj_validated_auto_blit_candidate(const struct cv1k_machine *m, cv1k_u32 base_off, cv1k_u32 end_off)
+{
+    cv1k_u32 addr;
+    cv1k_u32 ops;
+    cv1k_u32 draw_ops;
+    cv1k_u32 upload_ops;
+    cv1k_u32 clip_ops;
+    cv1k_u32 suspicious_0300_tiles;
+    cv1k_u32 unique_src_transitions;
+    cv1k_u32 last_src_key;
+    cv1k_u32 tiny_draws;
+    cv1k_u32 large_draws;
+    cv1k_u32 bytes;
+
+    if (m == NULL || m->main_ram == NULL) return 0;
+    if (end_off <= base_off) return 0;
+    bytes = end_off - base_off;
+    if (bytes < 0x1800UL || bytes > 0x400000UL) return 0;
+    if (end_off > m->main_ram_size) return 0;
+
+    addr = base_off;
+    ops = 0UL;
+    draw_ops = 0UL;
+    upload_ops = 0UL;
+    clip_ops = 0UL;
+    suspicious_0300_tiles = 0UL;
+    unique_src_transitions = 0UL;
+    last_src_key = 0xffffffffUL;
+    tiny_draws = 0UL;
+    large_draws = 0UL;
+
+    while (addr + 2UL <= end_off && ops < 8192UL) {
+        cv1k_u16 op;
+        cv1k_u16 xraw;
+        cv1k_u16 yraw;
+        cv1k_u32 w;
+        cv1k_u32 h;
+        cv1k_u32 need;
+        cv1k_u32 src_x;
+        cv1k_u32 src_y;
+        cv1k_u32 src_key;
+
+        if (!cv1k_ram_read16_off_direct(m, addr, &op)) return 0;
+        if (op == 0U || op == 0xffffU) break;
+
+        switch (op & CV1K_BLIT_OP_MASK) {
+        case CV1K_BLIT_OP_DRAW:
+            if (addr + CV1K_DRAW_OPERATION_SIZE_BYTES > end_off) return 0;
+            if (!cv1k_ram_read16_off_direct(m, addr + 4UL, &xraw)) return 0;
+            if (!cv1k_ram_read16_off_direct(m, addr + 6UL, &yraw)) return 0;
+            src_x = (cv1k_u32)(xraw & 0x1fffU);
+            src_y = (cv1k_u32)(yraw & 0x0fffU);
+            if (!cv1k_ram_read16_off_direct(m, addr + 12UL, &xraw)) return 0;
+            if (!cv1k_ram_read16_off_direct(m, addr + 14UL, &yraw)) return 0;
+            w = (cv1k_u32)(xraw & 0x1fffU) + 1UL;
+            h = (cv1k_u32)(yraw & 0x0fffU) + 1UL;
+            src_key = (src_y << 13) ^ src_x;
+            if (src_key != last_src_key) {
+                unique_src_transitions++;
+                last_src_key = src_key;
+            }
+            if (src_x == 0x0300UL && src_y == 0UL && w == 32UL && h == 32UL) suspicious_0300_tiles++;
+            if (w <= 64UL && h <= 96UL) tiny_draws++;
+            if (w >= 160UL || h >= 160UL) large_draws++;
+            draw_ops++;
+            addr += CV1K_DRAW_OPERATION_SIZE_BYTES;
+            break;
+
+        case CV1K_BLIT_OP_UPLOAD:
+            if (addr + CV1K_UPLOAD_HEADER_SIZE_BYTES > end_off) return 0;
+            if (!cv1k_ram_read16_off_direct(m, addr + 12UL, &xraw)) return 0;
+            if (!cv1k_ram_read16_off_direct(m, addr + 14UL, &yraw)) return 0;
+            w = (cv1k_u32)(xraw & 0x1fffU) + 1UL;
+            h = (cv1k_u32)(yraw & 0x0fffU) + 1UL;
+            if (w == 0UL || h == 0UL) return 0;
+            if (w > 0x2000UL || h > 0x1000UL) return 0;
+            if (w > (0xffffffffUL / h)) return 0;
+            if (w * h > ((0xffffffffUL - CV1K_UPLOAD_HEADER_SIZE_BYTES) / 2UL)) return 0;
+            need = CV1K_UPLOAD_HEADER_SIZE_BYTES + w * h * 2UL;
+            if (addr + need < addr || addr + need > end_off) return 0;
+            upload_ops++;
+            addr += need;
+            break;
+
+        case CV1K_BLIT_OP_CLIP:
+            if (addr + CV1K_CLIP_OPERATION_SIZE_BYTES > end_off) return 0;
+            clip_ops++;
+            addr += CV1K_CLIP_OPERATION_SIZE_BYTES;
+            break;
+
+        default:
+            return 0;
+        }
+        ops++;
+    }
+
+    if (draw_ops < 16UL) return 0;
+    if (ops == 0UL) return 0;
+
+    /* The v54/v55 title corruption was a short-lived font/atlas pointer that
+     * drew mostly 32x32 tiles from VRAM source 0x0300,0 over the visible area.
+     * MAME never replays a RAM pointer like this after a visible MMIO launch;
+     * while this sandbox still needs a bounded fallback, reject that pattern
+     * and only accept fuller command streams with source variety.
+     */
+    if (suspicious_0300_tiles != 0UL && suspicious_0300_tiles * 2UL >= draw_ops) return 0;
+    if (unique_src_transitions < 4UL && upload_ops == 0UL) return 0;
+    if (tiny_draws == 0UL && large_draws == 0UL) return 0;
+    (void)clip_ops;
+    return 1;
+}
+
+static cv1k_u32 cv1k_blit_list_signature(const cv1k_u8 *data, cv1k_u32 len)
+{
+    cv1k_u32 h;
+    cv1k_u32 i;
+    h = 2166136261UL;
+    for (i = 0UL; i < len; i++) {
+        h ^= (cv1k_u32)data[i];
+        h *= 16777619UL;
+    }
+    if (h == 0UL) h = 1UL;
+    return h;
+}
+
 static int cv1k_ddpsdoj_auto_blit_list(struct cv1k_machine *m)
 {
     cv1k_u32 base_ptr;
@@ -365,9 +506,30 @@ static int cv1k_ddpsdoj_auto_blit_list(struct cv1k_machine *m)
     if (!cv1k_work_ptr_to_offset(m, base_ptr, &base_off)) return 0;
     if (!cv1k_work_ptr_to_offset(m, end_ptr, &end_off)) return 0;
     if (end_off <= base_off || end_off - base_off < 20UL || end_off - base_off > 0x400000UL) return 0;
+    /* MAME starts the CV1000 blitter only via the 0x18000004 execute register.
+     * This sandbox can still miss later launches because its SH7709S/cache/IRQ
+     * path is incomplete, so the DDPSDOJ RAM-pointer fallback remains bounded
+     * and conservative.  v58/v59 blocked all post-visible short lists; that was
+     * too blunt and also hid valid post-start command streams.  After a real
+     * visible MMIO launch, only replay lists that parse as a complete CV1000
+     * stream and do not match the known font/atlas overwrite pattern.
+     */
+    if (m->video.mmio_execs != 0UL && m->video.last_frame_nonzero != 0UL) {
+        if (!cv1k_ddpsdoj_validated_auto_blit_candidate(m, base_off, end_off)) return 0;
+    }
     if (base_off + 2UL > m->main_ram_size) return 0;
     op = cv1k_be16(&m->main_ram[base_off]);
     if ((op & 0xf000U) != 0x1000U && (op & 0xf000U) != 0x2000U && (op & 0xf000U) != 0xc000U) return 0;
+
+    {
+        cv1k_u32 sig;
+        sig = cv1k_blit_list_signature(&m->main_ram[base_off], end_off - base_off);
+        if (m->auto_blits != 0UL && m->auto_blit_last_base == base_off && m->auto_blit_last_end == end_off && m->auto_blit_last_sig == sig) {
+            m->auto_blit_skips++;
+            return 0;
+        }
+        m->auto_blit_last_sig = sig;
+    }
 
     /* DDPSDOJ's copied renderer builds the normal CV1000 command stream in
      * RAM, but this standalone SH/IRQ path can miss the later MMIO launch.
@@ -930,14 +1092,15 @@ void cv1k_machine_frame(struct cv1k_machine *m)
             break;
         }
     }
+    cv1k_video_tick_cycles(&m->video, m->cpu.cycles - cycles_before);
     cv1k_bus_tmu_tick(&m->bus);
     if (m->irq2_enabled) {
-        /* SH7709S runs at roughly 200 MHz on CV1000, and MAME's screen
+        /* SH7709S runs at 102.4 MHz on CV1000 (12.8MHz * 8), and MAME's screen
          * pulse is 60.024 Hz.  A sandbox frame is only a small interpreter
          * timeslice, so requesting IRQ2 every call floods the boot code long
          * before the real board would see a video interrupt.
          */
-        crossed_vblank = (cycles_before / 3332000UL) != (m->cpu.cycles / 3332000UL);
+        crossed_vblank = (cycles_before / CV1K_CYCLES_PER_VBLANK) != (m->cpu.cycles / CV1K_CYCLES_PER_VBLANK);
         speedup_irq = speedup_did_tick && m->video.executed_ops != 0UL && ((m->mame_speedup_spins & 0x3ffUL) == 0UL);
         if (crossed_vblank || speedup_irq) {
             int irq_pri;
@@ -949,7 +1112,14 @@ void cv1k_machine_frame(struct cv1k_machine *m)
         }
     } else if (!speedup_did_tick) cv1k_synthetic_vblank_tick(m);
     render_frame = crossed_vblank || speedup_irq || speedup_did_tick || ((m->frames & 0x3ffUL) == 0UL);
-    if (render_frame && (m->auto_blits == 0UL || ((m->frames & 0x0fUL) == 0UL))) cv1k_ddpsdoj_auto_blit_list(m);
+    /* The fallback still never replaces MAME's MMIO execute path; it only
+     * catches bounded game-built lists when the standalone SH path misses a
+     * launch.  Validation inside cv1k_ddpsdoj_auto_blit_list() rejects the
+     * title/coin atlas overwrite pattern that earlier builds replayed.
+     */
+    if (render_frame && (m->auto_blits == 0UL || ((m->frames & 0x0fUL) == 0UL))) {
+        cv1k_ddpsdoj_auto_blit_list(m);
+    }
     if (render_frame) cv1k_video_frame(&m->video, m->main_ram, m->main_ram_size);
     m->frames++;
 }
@@ -994,13 +1164,13 @@ void cv1k_machine_status(const struct cv1k_machine *m, char *out, cv1k_u32 out_s
         (unsigned long)m->dma_timer_active[1],
         (unsigned long)m->dma_timer_active[2],
         (unsigned long)m->dma_timer_active[3]);
-    p += sprintf(p, "scroll=%lu/%lu clip=%lu,%lu,%lu,%lu list=%06lx lup=%06lx:%lu,%lu,%lu,%lu/%lu/%lu ldr=%06lx:%04lx/%04lx:%lu,%lu>%ld,%ld:%lu,%lu/%lu/%lu/%lu fnz=%lu ",
+    p += sprintf(p, "scroll=%lu/%lu clip=%ld,%ld,%ld,%ld list=%06lx lup=%06lx:%lu,%lu,%lu,%lu/%lu/%lu ldr=%06lx:%04lx/%04lx:%lu,%lu>%ld,%ld:%lu,%lu/%lu/%lu/%lu fnz=%lu ",
         (unsigned long)m->video.gfx_scroll_x,
         (unsigned long)m->video.gfx_scroll_y,
-        (unsigned long)m->video.clip_x,
-        (unsigned long)m->video.clip_y,
-        (unsigned long)m->video.clip_w,
-        (unsigned long)m->video.clip_h,
+        (long)m->video.clip_x,
+        (long)m->video.clip_y,
+        (long)m->video.clip_w,
+        (long)m->video.clip_h,
         (unsigned long)m->video.last_list_addr,
         (unsigned long)m->video.last_upload_addr,
         (unsigned long)m->video.last_upload_x,
@@ -1058,7 +1228,7 @@ void cv1k_machine_status(const struct cv1k_machine *m, char *out, cv1k_u32 out_s
         (long)m->video.fpga_firmware_version,
         (unsigned long)m->icache_hits,
         (unsigned long)m->icache_misses);
-    p += sprintf(p, "dcache=%lu/%lu stale=%lu mcache=%d/%lu/%lu/%lu/%lu/%lu/%lu cachectl=%d mtrap=%d mspeed=%d/%lu active=%08lx breg=%08lx/%08lx/%08lx/%08lx autoblit=%lu/%06lx-%06lx fulldma=%d mtmu=%d widep0=%d compact400=%d dmasync=%d dmainv=%lu ndata=%d ports=C%02x/%lu@%08lx D%02x/%lu@%08lx E%02x/%lu@%08lx F%02x/%lu@%08lx L%02x/%lu@%08lx nandcmd=%02lx pg=%lu col=%lu rnd=%lu spr=%lu nmap=%lu/%lu/%lu/%lu ce=%d ",
+    p += sprintf(p, "dcache=%lu/%lu stale=%lu mcache=%d/%lu/%lu/%lu/%lu/%lu/%lu cachectl=%d mtrap=%d mspeed=%d/%lu active=%08lx breg=%08lx/%08lx/%08lx/%08lx mmio=%lu/%08lx autoblit=%lu/%06lx-%06lx skip=%lu fulldma=%d mtmu=%d widep0=%d compact400=%d dmasync=%d dmainv=%lu ndata=%d ports=C%02x/%lu@%08lx D%02x/%lu@%08lx E%02x/%lu@%08lx F%02x/%lu@%08lx L%02x/%lu@%08lx nandcmd=%02lx pg=%lu col=%lu rnd=%lu spr=%lu nmap=%lu/%lu/%lu/%lu ce=%d ",
         (unsigned long)m->dcache_hits,
         (unsigned long)m->dcache_misses,
         (unsigned long)m->dcache_dma_stale,
@@ -1078,9 +1248,12 @@ void cv1k_machine_status(const struct cv1k_machine *m, char *out, cv1k_u32 out_s
         (unsigned long)m->video.regs[0x08UL >> 2],
         (unsigned long)m->video.regs[0x14UL >> 2],
         (unsigned long)m->video.regs[0x18UL >> 2],
+        (unsigned long)m->video.mmio_execs,
+        (unsigned long)m->video.last_mmio_list_addr,
         (unsigned long)m->auto_blits,
         (unsigned long)m->auto_blit_last_base,
         (unsigned long)m->auto_blit_last_end,
+        (unsigned long)m->auto_blit_skips,
         m->mame_full_dmatcr,
         m->mame_tmu_irq,
         m->wide_p0_alias,
