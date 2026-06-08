@@ -16,6 +16,8 @@
 #include "mame_cv1k_derived.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+
 
 #define CV1K_SH_SR_T 0x00000001UL
 
@@ -922,6 +924,16 @@ void cv1k_machine_frame_advance(struct cv1k_machine *m, int render)
     }
 
     if (render) cv1k_video_frame(&m->video, m->main_ram, m->main_ram_size);
+#ifdef DEBUG
+    if (getenv("FBTRACE")) {
+        static unsigned long pnand;
+        unsigned long nr = (unsigned long)m->nand.reads;
+        fprintf(stderr, "[FB f=%lu busy=%u left=%lu nz=%lu nandd=%lu dma=%lu]\n",
+                (unsigned long)m->frames, m->video.busy, (unsigned long)m->video.busy_cycles_left,
+                (unsigned long)m->video.last_frame_nonzero, nr - pnand, (unsigned long)m->dma_transfers);
+        pnand = nr;
+    }
+#endif
     m->frames++;
 }
 
