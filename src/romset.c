@@ -27,12 +27,44 @@ struct rom_spec {
 #define ROLE_U23 2
 #define ROLE_U24 3
 
-static const struct rom_spec ddpsdoj_specs[CV1K_ROM_ENTRY_COUNT] = {
-    { "u2",  0x668e4cd6UL, 0x08400000UL, 0x08400000UL, 0, ROLE_U2  },
-    { "u4",  0xe2a4411cUL, 0x00400100UL, 0x00400000UL, 1, ROLE_U4  },
-    { "u23", 0xac94801cUL, 0x00400100UL, 0x00400000UL, 1, ROLE_U23 },
-    { "u24", 0xf593045bUL, 0x00400100UL, 0x00400000UL, 1, ROLE_U24 }
+struct game_set {
+    const char *name;
+    /* Entry order is fixed: [0]=NAND(u2), [1]=boot(u4), [2]=sound low(u23),
+     * [3]=sound high(u24).  CRCs/sizes/file names taken from the MAME 0.282
+     * cave/cv1k.cpp driver manifest (non-merged sets). */
+    struct rom_spec specs[CV1K_ROM_ENTRY_COUNT];
 };
+
+/* The boot ROM (u4) CRC uniquely identifies each set, so detection keys on it.
+ * ddpsdoj is first and is used as the fallback when nothing else matches, which
+ * preserves the previous single-set behaviour for unknown dumps. */
+static const struct game_set g_games[] = {
+    { "ddpsdoj", {
+        { "u2",  0x668e4cd6UL, 0x08400000UL, 0x08400000UL, 0, ROLE_U2  },
+        { "u4",  0xe2a4411cUL, 0x00400100UL, 0x00400000UL, 1, ROLE_U4  },
+        { "u23", 0xac94801cUL, 0x00400100UL, 0x00400000UL, 1, ROLE_U23 },
+        { "u24", 0xf593045bUL, 0x00400100UL, 0x00400000UL, 1, ROLE_U24 } } },
+    { "mmpork", {
+        { "u2",  0x1ee961b8UL, 0x08400000UL, 0x08400000UL, 0, ROLE_U2  },
+        { "u4",  0xd06cfa42UL, 0x00200000UL, 0x00200000UL, 1, ROLE_U4  },
+        { "u23", 0x4a4b36dfUL, 0x00400000UL, 0x00400000UL, 1, ROLE_U23 },
+        { "u24", 0xce83d07bUL, 0x00400000UL, 0x00400000UL, 1, ROLE_U24 } } },
+    { "mmmbanc", {
+        { "u2",  0x2e38965aUL, 0x08400000UL, 0x08400000UL, 0, ROLE_U2  },
+        { "u4",  0x5589d8c6UL, 0x00200000UL, 0x00200000UL, 1, ROLE_U4  },
+        { "u23", 0x4caaa1bfUL, 0x00400000UL, 0x00400000UL, 1, ROLE_U23 },
+        { "u24", 0x8e3a51baUL, 0x00400000UL, 0x00400000UL, 1, ROLE_U24 } } },
+    { "pinkswts", {
+        { "pinkswts_u2", 0xa2fa5363UL, 0x08400000UL, 0x08400000UL, 0, ROLE_U2  },
+        { "pinkswts_u4", 0x5d812c9eUL, 0x00200000UL, 0x00200000UL, 1, ROLE_U4  },
+        { "u23",         0x4b82d250UL, 0x00400000UL, 0x00400000UL, 1, ROLE_U23 },
+        { "u24",         0xe93f0627UL, 0x00400000UL, 0x00400000UL, 1, ROLE_U24 } } }
+};
+
+#define CV1K_GAME_COUNT (sizeof(g_games) / sizeof(g_games[0]))
+
+/* Active set: defaults to ddpsdoj, replaced by detection in the loader. */
+static const struct rom_spec *ddpsdoj_specs = g_games[0].specs;
 
 static cv1k_u16 le16(const cv1k_u8 *p)
 {
@@ -52,19 +84,29 @@ static void setmsg(struct cv1k_romset_report *r, const char *s)
     }
 }
 
-void cv1k_romset_report_clear(struct cv1k_romset_report *r)
+/* Point the report at a specific game manifest without discarding fields the
+ * caller may already have populated (source_path is preserved by callers). */
+static void report_set_game(struct cv1k_romset_report *r, const struct game_set *g)
 {
     int i;
+    if (r == NULL || g == NULL) return;
+    strncpy(r->set_name, g->name, sizeof(r->set_name) - 1U);
+    r->set_name[sizeof(r->set_name) - 1U] = '\0';
+    for (i = 0; i < CV1K_ROM_ENTRY_COUNT; i++) {
+        strncpy(r->entry[i].name, g->specs[i].name, sizeof(r->entry[i].name) - 1U);
+        r->entry[i].name[sizeof(r->entry[i].name) - 1U] = '\0';
+        r->entry[i].expected_crc = g->specs[i].expected_crc;
+        r->entry[i].source_size = g->specs[i].source_size;
+        r->entry[i].loaded_size = g->specs[i].load_size;
+        r->entry[i].ignored_tail = (int)(g->specs[i].source_size - g->specs[i].load_size);
+    }
+}
+
+void cv1k_romset_report_clear(struct cv1k_romset_report *r)
+{
     if (r == NULL) return;
     memset(r, 0, sizeof(*r));
-    strcpy(r->set_name, "ddpsdoj");
-    for (i = 0; i < CV1K_ROM_ENTRY_COUNT; i++) {
-        strncpy(r->entry[i].name, ddpsdoj_specs[i].name, sizeof(r->entry[i].name) - 1U);
-        r->entry[i].expected_crc = ddpsdoj_specs[i].expected_crc;
-        r->entry[i].source_size = ddpsdoj_specs[i].source_size;
-        r->entry[i].loaded_size = ddpsdoj_specs[i].load_size;
-        r->entry[i].ignored_tail = (int)(ddpsdoj_specs[i].source_size - ddpsdoj_specs[i].load_size);
-    }
+    report_set_game(r, &g_games[0]);
 }
 
 static cv1k_u32 crc32_buf(const cv1k_u8 *p, cv1k_u32 n)
@@ -335,15 +377,60 @@ static int load_from_zip(struct cv1k_machine *m, const char *path, struct cv1k_r
 }
 #endif
 
+/* Identify the CV1000 set by its boot ROM (u4) CRC so the report uses the
+ * matching manifest instead of always assuming ddpsdoj.  Returns an index into
+ * g_games; falls back to 0 (ddpsdoj) when nothing matches. */
+static int detect_game(const char *path, int is_zip)
+{
+    unsigned int g;
+#ifdef CV1K_WITH_ZLIB
+    if (is_zip) {
+        cv1k_u8 *zip = NULL;
+        cv1k_u32 zsz = 0UL;
+        int found = 0;
+        if (!load_file_alloc(path, &zip, &zsz)) return 0;
+        for (g = 0U; g < CV1K_GAME_COUNT; g++) {
+            cv1k_u8 *buf = NULL;
+            cv1k_u32 size = 0UL;
+            if (zip_extract_entry(zip, zsz, g_games[g].specs[1].name, &buf, &size)) {
+                cv1k_u32 crc = crc32_buf(buf, size);
+                cv1k_free(buf);
+                if (crc == g_games[g].specs[1].expected_crc) { found = (int)g; break; }
+            }
+        }
+        cv1k_free(zip);
+        return found;
+    }
+#endif
+    for (g = 0U; g < CV1K_GAME_COUNT; g++) {
+        char p[512];
+        cv1k_u8 *buf = NULL;
+        cv1k_u32 size = 0UL;
+        size_t n = strlen(path);
+        if (n > 0U && (path[n - 1U] == '/' || path[n - 1U] == '\\')) sprintf(p, "%s%s", path, g_games[g].specs[1].name);
+        else sprintf(p, "%s/%s", path, g_games[g].specs[1].name);
+        if (load_file_alloc(p, &buf, &size)) {
+            cv1k_u32 crc = crc32_buf(buf, size);
+            cv1k_free(buf);
+            if (crc == g_games[g].specs[1].expected_crc) return (int)g;
+        }
+    }
+    return 0;
+}
+
 int cv1k_romset_load_ddpsdoj(struct cv1k_machine *m, const char *path, struct cv1k_romset_report *report)
 {
     int ok;
+    int gi;
     cv1k_romset_report_clear(report);
     if (report != NULL && path != NULL) {
         strncpy(report->source_path, path, sizeof(report->source_path) - 1U);
         report->source_path[sizeof(report->source_path) - 1U] = '\0';
     }
     if (m == NULL || path == NULL || report == NULL) return 0;
+    gi = detect_game(path, path_is_zip(path));
+    ddpsdoj_specs = g_games[gi].specs;
+    report_set_game(report, &g_games[gi]);
     ok = 0;
     if (path_is_zip(path)) {
         report->used_zip = 1;
@@ -361,8 +448,13 @@ int cv1k_romset_load_ddpsdoj(struct cv1k_machine *m, const char *path, struct cv
     report->nand_loaded = m->nand.size;
     report->sound_loaded = m->sound_rom_size;
     report->ok = ok;
-    if (ok) setmsg(report, "ddpsdoj romset loaded and CRC matched MAME manifest");
-    else if (report->message[0] == '\0') setmsg(report, "romset load failed or CRC mismatch; see entries");
+    if (ok) {
+        char msg[128];
+        sprintf(msg, "%s romset loaded and CRC matched MAME manifest", report->set_name);
+        setmsg(report, msg);
+    } else if (report->message[0] == '\0') {
+        setmsg(report, "romset load failed or CRC mismatch; see entries");
+    }
     return ok;
 }
 

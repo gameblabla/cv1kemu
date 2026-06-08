@@ -28,6 +28,15 @@
 #define CV1K_REFRESH_MILLIHZ 60024UL
 #define CV1K_CYCLES_PER_VBLANK 1705984UL /* 102.4MHz / 60.024Hz, matching MAME CV1000 board clocks. */
 
+/* The SH7709S on-chip TMU is fed by the peripheral module clock (Pphi), not the
+ * CPU clock (Iphi).  On the CV1000 the CPG runs Pphi at Iphi/4, exactly like
+ * MAME's sh34_base_device::sh4_parse_configuration (m_pm_clock = m_clock / 4),
+ * whose TMU schedules underflows from from_hz(m_pm_clock) * prescaler.  Our TMU
+ * counts CV1K_CPU_CLOCK_HZ cycles, so the on-chip prescaler must be scaled by
+ * this factor or the timers (and any game logic they drive, e.g. the YMZ770
+ * music sequencer re-trigger) run 4x too fast. */
+#define CV1K_TMU_PCLK_DIV 4UL
+
 #define CV1K_ADDR_BOOT_ROM 0x00000000UL
 #define CV1K_ADDR_WORK_RAM 0x0c000000UL
 #define CV1K_ADDR_NAND_IO  0x10000000UL

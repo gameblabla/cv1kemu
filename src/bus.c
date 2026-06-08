@@ -223,7 +223,7 @@ static CV1K_HOT void tmu_update_channel(struct cv1k_machine *m, int ch)
     if (last == 0UL) { m->tmu_last_cycles[ch] = now; return; }
     delta = now - last;
     tcr = shio_read_be16(m, tmu_tcr_off(ch));
-    div = divs[tcr & 7U];
+    div = divs[tcr & 7U] * CV1K_TMU_PCLK_DIV;
     ticks = delta / div;
     if (ticks == 0UL) return;
     m->tmu_last_cycles[ch] = last + ticks * div;
@@ -303,7 +303,7 @@ CV1K_HOT cv1k_u32 cv1k_bus_cycles_until_event(struct cv1k_bus *bus)
         cv1k_u32 delta;
         if ((tstr & (1U << ch)) == 0U) continue;
         tcr = shio_read_be16(m, tmu_tcr_off(ch));
-        div = divs[tcr & 7U];
+        div = divs[tcr & 7U] * CV1K_TMU_PCLK_DIV;
         tcnt = shio_read_be32(m, tmu_tcnt_off(ch));
         delta = (tcnt == 0xffffffffUL) ? 0xffffffffUL : ((tcnt + 1UL) * div);
         if (delta < best) best = delta;
