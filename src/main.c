@@ -45,6 +45,9 @@ static void usage(void)
     printf("  --gles2-gpu-blitter  mirror supported CV1000 upload/draw commands into GLES2 tile FBOs\n");
     printf("  --gles2-software-blitter  keep GLES2 as presentation-only tile cache, default\n");
     printf("  --dump-display-ppm file  dump the frontend-oriented screen instead of raw 320x240\n");
+    printf("  --dump-ppm-series-dir dir  dump frame_XXXXXX.ppm captures during --run-frames\n");
+    printf("  --dump-display-ppm-series-dir dir  dump frontend-oriented frame_XXXXXX.ppm captures during --run-frames\n");
+    printf("  --dump-series-every n  frame interval for --dump-*-series-dir, default 120\n");
     printf("  --threads            enable optional worker threads for video render conversion and audio mixing\n");
     printf("  --threaded-render    enable only threaded video-frame conversion when possible\n");
     printf("  --threaded-audio     enable only threaded frontend/headless audio mixing when possible\n");
@@ -57,6 +60,7 @@ static void usage(void)
     printf("  --dcache              enable experimental non-coherent SH data-cache model\n");
     printf("  --strict-cache-ops    honor PREF/OCB/P4 cache-control invalidation experiments\n");
     printf("  --mame-cache-meta     collect MAME SH7709S-style 16KiB/16B/4-way cache metadata\n");
+    printf("  --sh7709s-cache-timing add experimental MAME 2026-style SH7709S cache/memory wait penalties\n");
     printf("  --mame-trapa          vector SH7709S TRAPA like MAME instead of diagnostic no-vector mode\n");
     printf("  --mame-speedup        emulate MAME's DDPSDOJ spin-until-interrupt speedup\n");
     printf("  --mame-full-dmatcr    use MAME's full 0x1000000 zero-DMATCR count (diagnostic)\n");
@@ -232,6 +236,28 @@ static void write_wav_header(FILE *f, cv1k_u32 sample_rate, cv1k_u32 channels, c
     fwrite(h, 1, 44, f);
 }
 
+static int write_series_ppm(struct cv1k_machine *m, const char *dir, int display, int frame)
+{
+    char path[1024];
+    if (m == NULL || dir == NULL) return 0;
+    if (snprintf(path, sizeof(path), "%s/frame_%06d.ppm", dir, frame) >= (int)sizeof(path)) {
+        fprintf(stderr, "warning: capture path too long for frame %d\n", frame);
+        return 0;
+    }
+    if (display) {
+        if (!cv1k_video_write_display_ppm(&m->video, m->display_rotation, path)) {
+            fprintf(stderr, "warning: display PPM series dump failed: %s\n", path);
+            return 0;
+        }
+    } else {
+        if (!cv1k_video_write_ppm(&m->video, path)) {
+            fprintf(stderr, "warning: PPM series dump failed: %s\n", path);
+            return 0;
+        }
+    }
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     struct cv1k_machine m;
@@ -250,6 +276,7 @@ int main(int argc, char **argv)
     int dcache_requested;
     int strict_cache_ops;
     int mame_cache_meta;
+    int sh7709s_cache_timing;
     int mame_trapa;
     int mame_speedup;
     int mame_full_dmatcr;
@@ -284,6 +311,9 @@ int main(int argc, char **argv)
     const char *dump_ppm;
     const char *dump_audio;
     const char *dump_display_ppm;
+    const char *dump_series_dir;
+    int dump_series_display;
+    int dump_series_every;
     struct input_script_event input_script[MAX_INPUT_SCRIPT_EVENTS];
     int input_script_count;
     cv1k_u32 blit_addr;
@@ -313,6 +343,7 @@ int main(int argc, char **argv)
     dcache_requested = 0;
     strict_cache_ops = 0;
     mame_cache_meta = 0;
+    sh7709s_cache_timing = 0;
     mame_trapa = 0;
     mame_speedup = 1;
     mame_full_dmatcr = 0;
@@ -349,6 +380,9 @@ int main(int argc, char **argv)
     dump_ppm = NULL;
     dump_audio = NULL;
     dump_display_ppm = NULL;
+    dump_series_dir = NULL;
+    dump_series_display = 0;
+    dump_series_every = 120;
     input_script_count = 0;
     blit_addr = 0UL;
     blit_requested = 0;
@@ -440,6 +474,9 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "--strict-cache-ops") == 0) {
             strict_cache_ops = 1;
         } else if (strcmp(argv[i], "--mame-cache-meta") == 0) {
+            mame_cache_meta = 1;
+        } else if (strcmp(argv[i], "--sh7709s-cache-timing") == 0) {
+            sh7709s_cache_timing = 1;
             mame_cache_meta = 1;
         } else if (strcmp(argv[i], "--mame-trapa") == 0) {
             mame_trapa = 1;
@@ -555,6 +592,18 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "--dump-display-ppm") == 0 && i + 1 < argc) {
             i++;
             dump_display_ppm = argv[i];
+        } else if (strcmp(argv[i], "--dump-ppm-series-dir") == 0 && i + 1 < argc) {
+            i++;
+            dump_series_dir = argv[i];
+            dump_series_display = 0;
+        } else if (strcmp(argv[i], "--dump-display-ppm-series-dir") == 0 && i + 1 < argc) {
+            i++;
+            dump_series_dir = argv[i];
+            dump_series_display = 1;
+        } else if (strcmp(argv[i], "--dump-series-every") == 0 && i + 1 < argc) {
+            i++;
+            dump_series_every = atoi(argv[i]);
+            if (dump_series_every <= 0) dump_series_every = 120;
         } else if (strcmp(argv[i], "--blit") == 0 && i + 1 < argc) {
             i++;
             blit_addr = parse_u32_arg(argv[i]);
@@ -584,6 +633,7 @@ int main(int argc, char **argv)
     m.dcache_enabled = dcache_requested;
     m.strict_cache_ops = strict_cache_ops;
     m.mame_cache_meta = mame_cache_meta;
+    m.sh7709s_cache_timing = sh7709s_cache_timing;
     m.mame_trapa = mame_trapa;
     m.mame_speedup = mame_speedup;
     m.mame_full_dmatcr = mame_full_dmatcr;
@@ -624,6 +674,7 @@ int main(int argc, char **argv)
         m.dcache_enabled = dcache_requested;
         m.strict_cache_ops = strict_cache_ops;
         m.mame_cache_meta = mame_cache_meta;
+        m.sh7709s_cache_timing = sh7709s_cache_timing;
         m.mame_trapa = mame_trapa;
         m.mame_speedup = mame_speedup;
         m.mame_full_dmatcr = mame_full_dmatcr;
@@ -723,6 +774,10 @@ int main(int argc, char **argv)
                 if (!mt_audio_active) fprintf(stderr, "warning: threaded audio worker unavailable; using single-threaded audio mix path\n");
             }
         }
+        if (dump_series_dir != NULL && dump_series_every > 0) {
+            cv1k_video_frame(&m.video, m.main_ram, m.main_ram_size);
+            write_series_ppm(&m, dump_series_dir, dump_series_display, 0);
+        }
         for (i = 0; i < run_frames; i++) {
             apply_input_script(&m.input, input_script, input_script_count, i);
             cv1k_machine_frame_advance(&m, mt_render_active ? 0 : m.render_screen);
@@ -772,6 +827,13 @@ int main(int argc, char **argv)
                     render_pending = 0;
                 }
                 present_hash = (present_hash * 33UL) ^ cv1k_video_present_checksum(&m.video);
+            }
+            if (dump_series_dir != NULL && dump_series_every > 0 && (((i + 1) % dump_series_every) == 0)) {
+                if (render_pending) {
+                    cv1k_mt_render_wait(mt_render, &m.video);
+                    render_pending = 0;
+                }
+                write_series_ppm(&m, dump_series_dir, dump_series_display, i + 1);
             }
         }
         if (render_pending) cv1k_mt_render_wait(mt_render, &m.video);

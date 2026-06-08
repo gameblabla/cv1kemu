@@ -789,6 +789,167 @@ static int mame_cache_meta_is_cacheable(cv1k_u32 addr)
     return region != 5UL && region != 7UL;
 }
 
+#define SH7709S_AREA_MASK 0x1fffffffUL
+#define SH7709S_CACHE_LINE_BURST_READ_PENALTY 6UL
+#define SH7709S_CACHE_LINE_BURST_WRITE_PENALTY 4UL
+#define SH7709S_CACHE_MISS_STALL_PENALTY 4UL
+#define SH7709S_BUS_ACCESS_PENALTY 2UL
+
+static cv1k_u32 sh7709s_cache_get_area(cv1k_u32 address)
+{
+    return (address & SH7709S_AREA_MASK) >> 26;
+}
+
+static int sh7709s_cache_is_sdram_region(cv1k_u32 address)
+{
+    cv1k_u32 area;
+    area = sh7709s_cache_get_area(address);
+    return area == 2UL || area == 3UL;
+}
+
+static int sh7709s_cache_can_burst(cv1k_u32 address)
+{
+    return sh7709s_cache_is_sdram_region(address);
+}
+
+static cv1k_u32 sh7709s_cache_wcr1_timing(cv1k_u32 address, cv1k_u16 wcr1)
+{
+    cv1k_u32 area;
+    cv1k_u32 area_shift;
+    cv1k_u32 area_val;
+    area = sh7709s_cache_get_area(address);
+    if (area > 6UL || area == 1UL) return 0UL;
+    area_shift = 12UL - (area * 2UL);
+    area_val = ((cv1k_u32)wcr1 >> area_shift) & 0x3UL;
+    if (area_val == 0UL) return 1UL;
+    return area_val;
+}
+
+static cv1k_u32 sh7709s_cache_wcr2_timing(cv1k_u32 address, cv1k_u16 wcr2)
+{
+    cv1k_u32 area;
+    cv1k_u32 area_val;
+    int burst_capable;
+    area = sh7709s_cache_get_area(address);
+    burst_capable = sh7709s_cache_can_burst(address);
+    if (area > 6UL || area == 1UL) return 0UL;
+    area_val = 0UL;
+    if (area == 0UL) {
+        area_val = (cv1k_u32)wcr2 & 0x7UL;
+    } else if (area == 2UL || area == 3UL) {
+        wcr2 >>= 3;
+        if (area == 3UL) wcr2 >>= 2;
+        area_val = (cv1k_u32)wcr2 & 0x3UL;
+        if (area_val == 0UL) return 1UL;
+        return area_val;
+    } else {
+        wcr2 >>= (cv1k_u16)(7U + ((area - 4UL) * 3UL));
+        area_val = (cv1k_u32)wcr2 & 0x7UL;
+    }
+    if (burst_capable) {
+        switch (area_val) {
+        case 0UL: return 2UL;
+        case 1UL: return 2UL;
+        case 2UL: return 3UL;
+        case 3UL: return 4UL;
+        case 4UL: return 4UL;
+        case 5UL: return 6UL;
+        case 6UL: return 8UL;
+        default: return 10UL;
+        }
+    }
+    switch (area_val) {
+    case 0UL: return 0UL;
+    case 1UL: return 1UL;
+    case 2UL: return 2UL;
+    case 3UL: return 3UL;
+    case 4UL: return 4UL;
+    case 5UL: return 6UL;
+    case 6UL: return 8UL;
+    default: return 10UL;
+    }
+}
+
+static cv1k_u32 sh7709s_cache_mcr_tpc(cv1k_u16 mcr)
+{
+    switch (((cv1k_u32)mcr >> 14) & 0x3UL) {
+    case 0UL: return 2UL;
+    case 1UL: return 5UL;
+    case 2UL: return 8UL;
+    default: return 11UL;
+    }
+}
+
+static cv1k_u32 sh7709s_cache_mcr_rcd(cv1k_u16 mcr)
+{
+    return (((cv1k_u32)mcr >> 12) & 0x3UL) + 1UL;
+}
+
+static cv1k_u32 sh7709s_cache_mcr_trwl(cv1k_u16 mcr)
+{
+    return (((cv1k_u32)mcr >> 10) & 0x3UL) + 1UL;
+}
+
+static cv1k_u32 sh7709s_cache_mcr_tras(cv1k_u16 mcr)
+{
+    return (((cv1k_u32)mcr >> 8) & 0x3UL) + 2UL;
+}
+
+static cv1k_u32 sh7709s_cache_external_penalty(struct cv1k_machine *m, cv1k_u32 address, int writeback)
+{
+    cv1k_u32 penalty;
+    cv1k_u32 area;
+    cv1k_u32 rcd;
+    cv1k_u16 wcr1;
+    cv1k_u16 wcr2;
+    cv1k_u16 mcr;
+    int burst_capable;
+
+    if (m == NULL) return 0UL;
+    penalty = 0UL;
+    area = sh7709s_cache_get_area(address);
+    burst_capable = sh7709s_cache_can_burst(address);
+    wcr1 = shio_read_be16(m, 0xff64UL);
+    wcr2 = shio_read_be16(m, 0xff66UL);
+    mcr = shio_read_be16(m, 0xff68UL);
+
+    if (area != (cv1k_u32)m->sh7709s_cache_last_area ||
+        ((cv1k_u32)m->sh7709s_cache_last_was_write != (cv1k_u32)(writeback ? 1 : 0))) {
+        penalty += sh7709s_cache_wcr1_timing(address, wcr1);
+    }
+    m->sh7709s_cache_last_area = (cv1k_u8)area;
+    m->sh7709s_cache_last_was_write = (cv1k_u8)(writeback ? 1U : 0U);
+
+    if (burst_capable && !writeback) penalty += SH7709S_CACHE_LINE_BURST_READ_PENALTY;
+    if (burst_capable && writeback) penalty += SH7709S_CACHE_LINE_BURST_WRITE_PENALTY - 1UL;
+
+    if (!burst_capable) {
+        penalty += (SH7709S_BUS_ACCESS_PENALTY + sh7709s_cache_wcr2_timing(address, wcr2)) * 4UL;
+    } else if (!writeback) {
+        penalty += SH7709S_CACHE_MISS_STALL_PENALTY + sh7709s_cache_wcr2_timing(address, wcr2);
+    }
+
+    if (sh7709s_cache_is_sdram_region(address)) {
+        rcd = sh7709s_cache_mcr_rcd(mcr);
+        penalty += SH7709S_BUS_ACCESS_PENALTY;
+        penalty += 1UL; /* ACTV command issue */
+        penalty += rcd;
+        penalty += 1UL; /* column command issue */
+        penalty += sh7709s_cache_mcr_tpc(mcr);
+        penalty += sh7709s_cache_mcr_tras(mcr);
+        if (rcd >= 2UL) penalty += rcd - 1UL;
+    }
+    return penalty;
+}
+
+static void sh7709s_cache_apply_penalty(struct cv1k_machine *m, cv1k_u32 penalty)
+{
+    if (m == NULL || penalty == 0UL) return;
+    m->cpu.cycles += penalty;
+    m->sh7709s_cache_penalty_cycles += penalty;
+    m->sh7709s_cache_penalty_events++;
+}
+
 static void mame_cache_meta_access(struct cv1k_machine *m, cv1k_u32 vaddr, cv1k_u32 phys, int write, int fetch)
 {
     cv1k_u32 cache_address;
@@ -798,18 +959,28 @@ static void mame_cache_meta_access(struct cv1k_machine *m, cv1k_u32 vaddr, cv1k_
     cv1k_u32 victim;
     cv1k_u8 old_lru;
     cv1k_u8 lru;
+    int hit;
+    int dirty_evict;
+    cv1k_u32 evict_address;
+    cv1k_u32 penalty;
 
     if (m == NULL) return;
-    if (!m->mame_cache_meta) return;
+    if (!m->mame_cache_meta && !m->sh7709s_cache_timing) return;
+    if (m->sh7709s_cache_timing_suppress != 0) return;
     if (!mame_cache_meta_is_cacheable(vaddr)) return;
     if (cv1k_is_physical_device_window(phys)) return;
 
-    if (fetch) m->mame_cache_fetches++;
-    else if (write) m->mame_cache_writes++;
-    else m->mame_cache_reads++;
+    if (m->mame_cache_meta) {
+        if (fetch) m->mame_cache_fetches++;
+        else if (write) m->mame_cache_writes++;
+        else m->mame_cache_reads++;
+    }
 
     cache_address = phys / CV1K_SH7709S_CACHE_LINE_SIZE;
     cache_block = cache_address % CV1K_SH7709S_CACHE_BLOCKS;
+    hit = 0;
+    dirty_evict = 0;
+    evict_address = 0UL;
 
     for (i = 0UL; i < CV1K_SH7709S_CACHE_ASSOCIATIVITY; i++) {
         if (m->mame_cache_tag[cache_block][i] == cache_address) {
@@ -821,28 +992,65 @@ static void mame_cache_meta_access(struct cv1k_machine *m, cv1k_u32 vaddr, cv1k_
                 }
                 m->mame_cache_lru[cache_block][i] = (cv1k_u8)(CV1K_SH7709S_CACHE_ASSOCIATIVITY - 1UL);
             }
-            m->mame_cache_hits++;
-            return;
-        }
-    }
-
-    m->mame_cache_misses++;
-    victim = 0UL;
-    for (i = 0UL; i < CV1K_SH7709S_CACHE_ASSOCIATIVITY; i++) {
-        if (m->mame_cache_lru[cache_block][i] == 0U) {
-            victim = i;
+            hit = 1;
+            if (m->mame_cache_meta) m->mame_cache_hits++;
             break;
         }
     }
-    if (m->mame_cache_dirty[cache_block][victim]) m->mame_cache_dirty_evicts++;
 
-    lru = m->mame_cache_lru[cache_block][victim];
-    m->mame_cache_tag[cache_block][victim] = cache_address;
-    m->mame_cache_lru[cache_block][victim] = (cv1k_u8)(CV1K_SH7709S_CACHE_ASSOCIATIVITY - 1UL);
-    m->mame_cache_dirty[cache_block][victim] = (cv1k_u8)(write ? 1U : 0U);
-    for (j = 0UL; j < CV1K_SH7709S_CACHE_ASSOCIATIVITY; j++) {
-        if (j != victim && m->mame_cache_lru[cache_block][j] > lru) m->mame_cache_lru[cache_block][j]--;
+    if (!hit) {
+        if (m->mame_cache_meta) m->mame_cache_misses++;
+        victim = 0UL;
+        for (i = 0UL; i < CV1K_SH7709S_CACHE_ASSOCIATIVITY; i++) {
+            if (m->mame_cache_lru[cache_block][i] == 0U) {
+                victim = i;
+                break;
+            }
+        }
+        if (m->mame_cache_dirty[cache_block][victim]) {
+            dirty_evict = 1;
+            evict_address = m->mame_cache_tag[cache_block][victim] * CV1K_SH7709S_CACHE_LINE_SIZE;
+            if (m->mame_cache_meta) m->mame_cache_dirty_evicts++;
+        }
+
+        lru = m->mame_cache_lru[cache_block][victim];
+        m->mame_cache_tag[cache_block][victim] = cache_address;
+        m->mame_cache_lru[cache_block][victim] = (cv1k_u8)(CV1K_SH7709S_CACHE_ASSOCIATIVITY - 1UL);
+        m->mame_cache_dirty[cache_block][victim] = (cv1k_u8)(write ? 1U : 0U);
+        for (j = 0UL; j < CV1K_SH7709S_CACHE_ASSOCIATIVITY; j++) {
+            if (j != victim && m->mame_cache_lru[cache_block][j] > lru) m->mame_cache_lru[cache_block][j]--;
+        }
+
+        if (m->sh7709s_cache_timing) {
+            penalty = 0UL;
+            if (dirty_evict) {
+                m->sh7709s_cache_wb_address = evict_address;
+                penalty += 1UL; /* move evicted line to writeback buffer */
+            }
+            penalty += sh7709s_cache_external_penalty(m, phys, 0);
+            sh7709s_cache_apply_penalty(m, penalty);
+        }
     }
+
+    if (m->sh7709s_cache_timing && m->sh7709s_cache_wb_address != 0UL) {
+        cv1k_u32 wb;
+        wb = m->sh7709s_cache_wb_address;
+        m->sh7709s_cache_wb_address = 0UL;
+        penalty = sh7709s_cache_mcr_trwl(shio_read_be16(m, 0xff68UL));
+        penalty += sh7709s_cache_external_penalty(m, wb, 1);
+        sh7709s_cache_apply_penalty(m, penalty);
+    }
+}
+
+void cv1k_bus_cache_access(struct cv1k_bus *bus, cv1k_u32 addr, int write, int fetch)
+{
+    struct cv1k_machine *m;
+    cv1k_u32 phys;
+    m = bus ? bus->machine : NULL;
+    if (m == NULL) return;
+    if (!m->mame_cache_meta && !m->sh7709s_cache_timing) return;
+    phys = cpu_addr_translate(m, addr);
+    mame_cache_meta_access(m, addr, phys, write, fetch);
 }
 
 static cv1k_u32 dcache_line_base(cv1k_u32 phys)

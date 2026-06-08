@@ -34,6 +34,8 @@ static cv1k_u32 g_stat_fallbacks = 0;
 static cv1k_u32 g_stat_invalidations = 0;
 static struct cv1k_sh3_jit_block *g_blocks[JIT_BUCKETS];
 static const struct cv1k_sh3_jit_backend *g_backend;
+static cv1k_u32 g_executing_blocks = 0;
+static int g_reset_pending = 0;
 #ifdef CV1K_JIT_FALLBACK_PROFILE
 #include <stdio.h>
 static unsigned long long g_fallback_op_hist[65536];
@@ -95,39 +97,42 @@ static cv1k_u8 *hot_write_ptr(struct cv1k_bus *bus, cv1k_u32 addr, cv1k_u32 need
 cv1k_u8 cv1k_sh3_jit_read8(struct cv1k_bus *bus, cv1k_u32 addr)
 {
     cv1k_u8 *p = hot_read_ptr(bus, addr, 1U);
-    return p ? p[0] : cv1k_bus_read8(bus, addr);
+    if (p) { cv1k_bus_cache_access(bus, addr, 0, 0); return p[0]; }
+    return cv1k_bus_read8(bus, addr);
 }
 
 cv1k_u16 cv1k_sh3_jit_read16(struct cv1k_bus *bus, cv1k_u32 addr)
 {
     cv1k_u8 *p = hot_read_ptr(bus, addr, 2U);
-    return p ? (cv1k_u16)(((cv1k_u16)p[0] << 8) | p[1]) : cv1k_bus_read16(bus, addr);
+    if (p) { cv1k_bus_cache_access(bus, addr, 0, 0); return (cv1k_u16)(((cv1k_u16)p[0] << 8) | p[1]); }
+    return cv1k_bus_read16(bus, addr);
 }
 
 cv1k_u32 cv1k_sh3_jit_read32(struct cv1k_bus *bus, cv1k_u32 addr)
 {
     cv1k_u8 *p = hot_read_ptr(bus, addr, 4U);
-    return p ? (((cv1k_u32)p[0] << 24) | ((cv1k_u32)p[1] << 16) | ((cv1k_u32)p[2] << 8) | p[3]) : cv1k_bus_read32(bus, addr);
+    if (p) { cv1k_bus_cache_access(bus, addr, 0, 0); return (((cv1k_u32)p[0] << 24) | ((cv1k_u32)p[1] << 16) | ((cv1k_u32)p[2] << 8) | p[3]); }
+    return cv1k_bus_read32(bus, addr);
 }
 
 void cv1k_sh3_jit_write8(struct cv1k_bus *bus, cv1k_u32 addr, cv1k_u32 data)
 {
     cv1k_u8 *p = hot_write_ptr(bus, addr, 1U);
-    if (p) p[0] = (cv1k_u8)data;
+    if (p) { cv1k_bus_cache_access(bus, addr, 1, 0); p[0] = (cv1k_u8)data; }
     else cv1k_bus_write8(bus, addr, (cv1k_u8)data);
 }
 
 void cv1k_sh3_jit_write16(struct cv1k_bus *bus, cv1k_u32 addr, cv1k_u32 data)
 {
     cv1k_u8 *p = hot_write_ptr(bus, addr, 2U);
-    if (p) { p[0] = (cv1k_u8)(data >> 8); p[1] = (cv1k_u8)data; }
+    if (p) { cv1k_bus_cache_access(bus, addr, 1, 0); p[0] = (cv1k_u8)(data >> 8); p[1] = (cv1k_u8)data; }
     else cv1k_bus_write16(bus, addr, (cv1k_u16)data);
 }
 
 void cv1k_sh3_jit_write32(struct cv1k_bus *bus, cv1k_u32 addr, cv1k_u32 data)
 {
     cv1k_u8 *p = hot_write_ptr(bus, addr, 4U);
-    if (p) { p[0] = (cv1k_u8)(data >> 24); p[1] = (cv1k_u8)(data >> 16); p[2] = (cv1k_u8)(data >> 8); p[3] = (cv1k_u8)data; }
+    if (p) { cv1k_bus_cache_access(bus, addr, 1, 0); p[0] = (cv1k_u8)(data >> 24); p[1] = (cv1k_u8)(data >> 16); p[2] = (cv1k_u8)(data >> 8); p[3] = (cv1k_u8)data; }
     else cv1k_bus_write32(bus, addr, data);
 }
 
@@ -243,8 +248,10 @@ static struct cv1k_sh3_jit_block *lookup_block(cv1k_u32 pc)
 
 static struct cv1k_sh3_jit_block *compile_block(struct cv1k_bus *bus, cv1k_u32 pc)
 {
+    struct cv1k_machine *m = bus ? bus->machine : NULL;
     struct cv1k_sh3_jit_block *b = calloc(1, sizeof(*b));
     if (!b) return NULL;
+    if (m != NULL) m->sh7709s_cache_timing_suppress++;
     b->pc = pc;
     for (size_t i = 0; i < JIT_MAX_OPS; i++) {
         cv1k_u32 opc = pc + (cv1k_u32)i * 2U;
@@ -276,6 +283,7 @@ static struct cv1k_sh3_jit_block *compile_block(struct cv1k_bus *bus, cv1k_u32 p
     cv1k_u32 h = hash_pc(pc);
     b->next = g_blocks[h];
     g_blocks[h] = b;
+    if (m != NULL && m->sh7709s_cache_timing_suppress != 0) m->sh7709s_cache_timing_suppress--;
     return b;
 }
 
@@ -343,7 +351,7 @@ void sh7709s_c23jit_stats(cv1k_u32 *blocks, cv1k_u32 *hits, cv1k_u32 *fallbacks,
 #endif
 }
 
-void sh7709s_c23jit_reset(void)
+static void sh7709s_c23jit_reset_now(void)
 {
     if (g_backend == NULL) g_backend = cv1k_sh3_jit_select_backend();
     for (size_t i = 0; i < JIT_BUCKETS; i++) {
@@ -356,6 +364,17 @@ void sh7709s_c23jit_reset(void)
         }
         g_blocks[i] = NULL;
     }
+}
+
+void sh7709s_c23jit_reset(void)
+{
+    if (g_executing_blocks != 0U) {
+        g_reset_pending = 1;
+        g_stat_invalidations++;
+        return;
+    }
+    sh7709s_c23jit_reset_now();
+    g_reset_pending = 0;
     g_stat_blocks = 0;
     g_stat_hits = 0;
     g_stat_fallbacks = 0;
@@ -387,7 +406,23 @@ cv1k_u32 sh7709s_c23jit_run_frame(struct sh7709s_cpu *cpu, struct cv1k_bus *bus,
             struct cv1k_sh3_jit_block *b = get_block(bus, cpu->pc);
             const cv1k_u32 to_tmu = next_tmu - cpu->cycles;
             if (b != NULL && !b->negative && b->fn != NULL && b->cycles != 0U && b->cycles < to_tmu) {
-                const cv1k_u32 ran = b->fn(cpu, bus);
+                cv1k_u32 ran;
+                {
+                    struct cv1k_machine *mm = bus ? bus->machine : NULL;
+                    if (mm != NULL && (mm->mame_cache_meta || mm->sh7709s_cache_timing)) {
+                        size_t oi;
+                        for (oi = 0; oi < b->op_count; oi++) {
+                            cv1k_bus_cache_access(bus, b->pc + (cv1k_u32)(oi * 2U), 0, 1);
+                        }
+                    }
+                }
+                g_executing_blocks++;
+                ran = b->fn(cpu, bus);
+                if (g_executing_blocks != 0U) g_executing_blocks--;
+                if (g_executing_blocks == 0U && g_reset_pending) {
+                    sh7709s_c23jit_reset_now();
+                    g_reset_pending = 0;
+                }
                 if (ran != 0U) {
                     if (jit_irq_can_accept_now(cpu)) sh7709s_accept_pending_irq(cpu, bus);
                     local_hits++;

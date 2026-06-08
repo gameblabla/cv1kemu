@@ -20,6 +20,7 @@ void cv1k_bus_write16(struct cv1k_bus *bus, cv1k_u32 addr, cv1k_u16 data);
 void cv1k_bus_write32(struct cv1k_bus *bus, cv1k_u32 addr, cv1k_u32 data);
 cv1k_u8 cv1k_bus_port_read(struct cv1k_bus *bus, int port_id);
 void cv1k_bus_cache_op(struct cv1k_bus *bus, cv1k_u32 addr, int op);
+void cv1k_bus_cache_access(struct cv1k_bus *bus, cv1k_u32 addr, int write, int fetch);
 void cv1k_bus_tmu_tick(struct cv1k_bus *bus);
 cv1k_u32 cv1k_bus_cycles_until_event(struct cv1k_bus *bus);
 void cv1k_bus_invalidate_icache_all(struct cv1k_bus *bus);

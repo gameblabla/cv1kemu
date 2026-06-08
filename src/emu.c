@@ -162,6 +162,12 @@ void cv1k_machine_reset(struct cv1k_machine *m)
     m->mame_cache_fetches = 0UL;
     m->mame_cache_reads = 0UL;
     m->mame_cache_writes = 0UL;
+    m->sh7709s_cache_timing_suppress = 0;
+    m->sh7709s_cache_wb_address = 0UL;
+    m->sh7709s_cache_last_area = 0U;
+    m->sh7709s_cache_last_was_write = 0U;
+    m->sh7709s_cache_penalty_cycles = 0UL;
+    m->sh7709s_cache_penalty_events = 0UL;
     m->dma_cache_invalidations = 0UL;
     m->alias_p1p2 = 0UL;
     m->alias_p4 = 0UL;
@@ -1051,7 +1057,7 @@ void cv1k_machine_status(const struct cv1k_machine *m, char *out, cv1k_u32 out_s
         (long)m->video.fpga_firmware_version,
         (unsigned long)m->icache_hits,
         (unsigned long)m->icache_misses);
-    p += sprintf(p, "dcache=%lu/%lu stale=%lu mcache=%d/%lu/%lu/%lu/%lu/%lu/%lu cachectl=%d mtrap=%d mspeed=%d/%lu active=%08lx breg=%08lx/%08lx/%08lx/%08lx mmio=%lu/%08lx autoblit=%lu/%06lx-%06lx skip=%lu fulldma=%d mtmu=%d mt=%d/%d/%lu/%lu widep0=%d compact400=%d dmasync=%d dmainv=%lu ndata=%d ports=C%02x/%lu@%08lx D%02x/%lu@%08lx E%02x/%lu@%08lx F%02x/%lu@%08lx L%02x/%lu@%08lx nandcmd=%02lx pg=%lu col=%lu rnd=%lu spr=%lu nmap=%lu/%lu/%lu/%lu ce=%d ",
+    p += sprintf(p, "dcache=%lu/%lu stale=%lu mcache=%d/%lu/%lu/%lu/%lu/%lu/%lu ctiming=%d/%lu/%lu cachectl=%d mtrap=%d mspeed=%d/%lu active=%08lx breg=%08lx/%08lx/%08lx/%08lx mmio=%lu/%08lx autoblit=%lu/%06lx-%06lx skip=%lu fulldma=%d mtmu=%d mt=%d/%d/%lu/%lu widep0=%d compact400=%d dmasync=%d dmainv=%lu ndata=%d ports=C%02x/%lu@%08lx D%02x/%lu@%08lx E%02x/%lu@%08lx F%02x/%lu@%08lx L%02x/%lu@%08lx nandcmd=%02lx pg=%lu col=%lu rnd=%lu spr=%lu nmap=%lu/%lu/%lu/%lu ce=%d ",
         (unsigned long)m->dcache_hits,
         (unsigned long)m->dcache_misses,
         (unsigned long)m->dcache_dma_stale,
@@ -1062,6 +1068,9 @@ void cv1k_machine_status(const struct cv1k_machine *m, char *out, cv1k_u32 out_s
         (unsigned long)m->mame_cache_fetches,
         (unsigned long)m->mame_cache_reads,
         (unsigned long)m->mame_cache_writes,
+        m->sh7709s_cache_timing,
+        (unsigned long)m->sh7709s_cache_penalty_cycles,
+        (unsigned long)m->sh7709s_cache_penalty_events,
         m->strict_cache_ops,
         m->mame_trapa,
         m->mame_speedup,

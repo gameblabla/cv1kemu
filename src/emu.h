@@ -59,6 +59,13 @@ struct cv1k_machine {
     cv1k_u32 mame_cache_fetches;
     cv1k_u32 mame_cache_reads;
     cv1k_u32 mame_cache_writes;
+    int sh7709s_cache_timing;
+    int sh7709s_cache_timing_suppress;
+    cv1k_u32 sh7709s_cache_wb_address;
+    cv1k_u8 sh7709s_cache_last_area;
+    cv1k_u8 sh7709s_cache_last_was_write;
+    cv1k_u32 sh7709s_cache_penalty_cycles;
+    cv1k_u32 sh7709s_cache_penalty_events;
     int irq2_enabled;
     int aggressive_boot_assists;
     int dcache_enabled;
