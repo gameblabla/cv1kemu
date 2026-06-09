@@ -38,16 +38,21 @@ enum cv1k_ir_op {
     IR_MOVI,     /* dst = imm                       */
     IR_MOV,      /* dst = a                         */
     /* alu (b = vreg or imm) */
-    IR_ADD, IR_SUB, IR_AND, IR_OR, IR_XOR, IR_NOT, IR_NEG,
+    IR_ADD, IR_SUB, IR_ADDC, IR_SUBC, IR_AND, IR_OR, IR_XOR, IR_NOT, IR_NEG,
     IR_MULU,     /* dst = a * b (low 32)            */
+    IR_DMUL_MACL, /* MACH:MACL = (u/s32)a * (u/s32)b; flags bit0=signed */
+    IR_MUL_MACL,  /* MACL = low product of guest regs in imm; aux selects width */
     IR_DECT,     /* dst = dst - 1; T = (dst == 0)  (SH DT)  */
     /* shifts / rotates; carry variants read/write the T pseudo via a/dst */
     IR_SHL, IR_SHR, IR_SAR, IR_ROL, IR_ROR, IR_ROCL, IR_ROCR,
+    IR_SHAD, IR_SHLD, /* SH-3 dynamic shifts */
     /* compare: dst(T-like 0/1) = (a cc b) */
     IR_CMP,      /* aux = cv1k_ir_cc                */
     /* memory (aux = size 1/2/4; IR_FLAG_SEXT for sign-extend loads) */
     IR_LOAD,     /* dst = [a]                       */
     IR_STORE,    /* [a] = b                         */
+    IR_LOADIDX,  /* dst = [a + b]                   */
+    IR_STOREIDX, /* [a + b] = dst                   */
     /* control / block exits */
     IR_EXIT,     /* end block, next pc = imm (static)        */
     IR_EXITVAR,  /* end block, next pc = a (computed)        */
