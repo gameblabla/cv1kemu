@@ -119,6 +119,7 @@ struct cv1k_machine {
     int render_screen;
     int mame_full_dmatcr;
     int mame_tmu_irq;
+    int ir_jit;            /* use the experimental IR DRC run-frame (--ir-jit)  */
     int threaded_render;
     int threaded_audio;
     int display_rotation;
@@ -156,6 +157,10 @@ struct cv1k_machine {
     cv1k_u32 video_busy_sync_cycles;
     cv1k_u32 last_blitter_status_pc;
     cv1k_u32 blitter_status_spin_reads;
+    /* Per-game vblank-wait idle loop PCs (MAME install_speedups idlepc, idlepc+2),
+     * set by the romset loader and re-applied to the cpu every frame. */
+    cv1k_u32 idle_pc0;
+    cv1k_u32 idle_pc1;
 };
 
 int cv1k_machine_init(struct cv1k_machine *m, int model);

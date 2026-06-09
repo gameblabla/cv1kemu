@@ -1,6 +1,24 @@
 #ifndef CV1K_CONFIG_H
 #define CV1K_CONFIG_H
 
+/* SH7709S cache-access timing model.
+ *
+ * MAME modelled the SH-3 cache cycle-accurately starting with commit
+ * b7c814a (in 0.288); that adds sh7709s_device::cache_access/access_penalty/
+ * drc_update_icache to the hot path and costs ~25-30% on CV1000 titles (it is
+ * why a 0.288 build is much slower than the pre-cache 0.282 binary).  Our
+ * equivalent models (--mame-cache-meta / --sh7709s-cache-timing) drive
+ * cv1k_bus_cache_access() from every SH-3 memory access.
+ *
+ * Default (CV1K_CACHE_ACCURATE == 0): the per-access cache hooks are compiled
+ * out entirely, so the fast build pays nothing for them (matches 0.282-era
+ * speed).  Build with `make ... CACHE=accurate` (-DCV1K_CACHE_ACCURATE=1) to
+ * compile the hooks back in and default the accurate cache timing on, matching
+ * MAME 0.288's behaviour. */
+#ifndef CV1K_CACHE_ACCURATE
+#define CV1K_CACHE_ACCURATE 0
+#endif
+
 #define CV1K_SCREEN_W 320U
 #define CV1K_SCREEN_H 240U
 #define CV1K_FRAMEBUFFER_W 512U

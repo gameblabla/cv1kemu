@@ -33,6 +33,11 @@ struct game_set {
      * [3]=sound high(u24).  CRCs/sizes/file names taken from the MAME 0.282
      * cave/cv1k.cpp driver manifest (non-merged sets). */
     struct rom_spec specs[CV1K_ROM_ENTRY_COUNT];
+    /* Per-game vblank-wait idle loop PC, matching MAME cv1k install_speedups()
+     * (idlepc).  The frame runners fast-forward past the spin loop when the main
+     * thread parks here, so this must match the game's init_* speedup or the
+     * whole frame's spin is interpreted (huge, needless host CPU use). */
+    cv1k_u32 idle_pc;
 };
 
 /* The boot ROM (u4) CRC uniquely identifies each set, so detection keys on it.
@@ -43,22 +48,30 @@ static const struct game_set g_games[] = {
         { "u2",  0x668e4cd6UL, 0x08400000UL, 0x08400000UL, 0, ROLE_U2  },
         { "u4",  0xe2a4411cUL, 0x00400100UL, 0x00400000UL, 1, ROLE_U4  },
         { "u23", 0xac94801cUL, 0x00400100UL, 0x00400000UL, 1, ROLE_U23 },
-        { "u24", 0xf593045bUL, 0x00400100UL, 0x00400000UL, 1, ROLE_U24 } } },
+        { "u24", 0xf593045bUL, 0x00400100UL, 0x00400000UL, 1, ROLE_U24 } },
+        /* ddpsdoj is ddpdfk-derived: MAME init_ddpdfk idlepc */
+        0x0c1d1346UL },
     { "mmpork", {
         { "u2",  0x1ee961b8UL, 0x08400000UL, 0x08400000UL, 0, ROLE_U2  },
         { "u4",  0xd06cfa42UL, 0x00200000UL, 0x00200000UL, 1, ROLE_U4  },
         { "u23", 0x4a4b36dfUL, 0x00400000UL, 0x00400000UL, 1, ROLE_U23 },
-        { "u24", 0xce83d07bUL, 0x00400000UL, 0x00400000UL, 1, ROLE_U24 } } },
+        { "u24", 0xce83d07bUL, 0x00400000UL, 0x00400000UL, 1, ROLE_U24 } },
+        /* MAME init_pinkswts idlepc */
+        0x0c05176aUL },
     { "mmmbanc", {
         { "u2",  0x2e38965aUL, 0x08400000UL, 0x08400000UL, 0, ROLE_U2  },
         { "u4",  0x5589d8c6UL, 0x00200000UL, 0x00200000UL, 1, ROLE_U4  },
         { "u23", 0x4caaa1bfUL, 0x00400000UL, 0x00400000UL, 1, ROLE_U23 },
-        { "u24", 0x8e3a51baUL, 0x00400000UL, 0x00400000UL, 1, ROLE_U24 } } },
+        { "u24", 0x8e3a51baUL, 0x00400000UL, 0x00400000UL, 1, ROLE_U24 } },
+        /* MAME init_pinkswts idlepc */
+        0x0c05176aUL },
     { "pinkswts", {
         { "pinkswts_u2", 0xa2fa5363UL, 0x08400000UL, 0x08400000UL, 0, ROLE_U2  },
         { "pinkswts_u4", 0x5d812c9eUL, 0x00200000UL, 0x00200000UL, 1, ROLE_U4  },
         { "u23",         0x4b82d250UL, 0x00400000UL, 0x00400000UL, 1, ROLE_U23 },
-        { "u24",         0xe93f0627UL, 0x00400000UL, 0x00400000UL, 1, ROLE_U24 } } }
+        { "u24",         0xe93f0627UL, 0x00400000UL, 0x00400000UL, 1, ROLE_U24 } },
+        /* MAME init_pinkswts idlepc */
+        0x0c05176aUL }
 };
 
 #define CV1K_GAME_COUNT (sizeof(g_games) / sizeof(g_games[0]))
@@ -431,6 +444,13 @@ int cv1k_romset_load_ddpsdoj(struct cv1k_machine *m, const char *path, struct cv
     gi = detect_game(path, path_is_zip(path));
     ddpsdoj_specs = g_games[gi].specs;
     report_set_game(report, &g_games[gi]);
+    /* Point the idle-loop fast-forward at this game's vblank-wait spin PC.  Kept
+     * on the machine so a mid-run CPU reset (which zeroes the cpu state) does not
+     * revert it; cv1k_machine_frame_advance re-applies it to the cpu each frame. */
+    m->idle_pc0 = g_games[gi].idle_pc;
+    m->idle_pc1 = g_games[gi].idle_pc + 2UL;
+    m->cpu.idle_pc0 = m->idle_pc0;
+    m->cpu.idle_pc1 = m->idle_pc1;
     ok = 0;
     if (path_is_zip(path)) {
         report->used_zip = 1;

@@ -52,6 +52,20 @@ void cv1k_sh3_jit_write16(struct cv1k_bus *bus, cv1k_u32 addr, cv1k_u32 data);
 void cv1k_sh3_jit_write32(struct cv1k_bus *bus, cv1k_u32 addr, cv1k_u32 data);
 void cv1k_sh3_jit_ldc_sr(struct sh7709s_cpu *cpu, cv1k_u32 n);
 void cv1k_sh3_jit_rte(struct sh7709s_cpu *cpu);
+/* Focused single-op helpers (exact interpreter semantics) for ops the codegen
+ * does not emit inline, so a block containing them still compiles instead of
+ * falling the whole block back to the interpreter. */
+void cv1k_sh3_jit_rotcl(struct sh7709s_cpu *cpu, cv1k_u32 n);
+void cv1k_sh3_jit_rotcr(struct sh7709s_cpu *cpu, cv1k_u32 n);
+void cv1k_sh3_jit_div0s(struct sh7709s_cpu *cpu, cv1k_u32 m, cv1k_u32 n);
+void cv1k_sh3_jit_div0u(struct sh7709s_cpu *cpu);
+void cv1k_sh3_jit_div1(struct sh7709s_cpu *cpu, cv1k_u32 m, cv1k_u32 n);
+void cv1k_sh3_jit_mull(struct sh7709s_cpu *cpu, cv1k_u32 m, cv1k_u32 n);
+void cv1k_sh3_jit_negc(struct sh7709s_cpu *cpu, cv1k_u32 m, cv1k_u32 n);
+void cv1k_sh3_jit_swapb(struct sh7709s_cpu *cpu, cv1k_u32 m, cv1k_u32 n);
+void cv1k_sh3_jit_swapw(struct sh7709s_cpu *cpu, cv1k_u32 m, cv1k_u32 n);
+void cv1k_sh3_jit_rotl(struct sh7709s_cpu *cpu, cv1k_u32 n);
+void cv1k_sh3_jit_rotr(struct sh7709s_cpu *cpu, cv1k_u32 n);
 
 cv1k_u32 cv1k_sh3_jit_linear_cycles(cv1k_u16 op);
 cv1k_u32 cv1k_sh3_jit_block_cycles_max(const cv1k_u16 *ops, size_t count);

@@ -6,6 +6,7 @@
 #include "savestate.h"
 #include "romset.h"
 #include "sh3_jit/cv1k_sh3_c23_jit.h"
+#include "sh3_jit/cv1k_ir.h"
 #include "threaded_runtime.h"
 #include <stdio.h>
 #include <string.h>
@@ -37,6 +38,7 @@ static void usage(void)
     printf("  --run-frames n        run without interactive UI\n");
     printf("  --cpu-backend interp|c23-x64  choose SH3 execution backend; interpreter remains the default/fallback\n");
     printf("  --c23-jit            alias for --cpu-backend c23-x64\n");
+    printf("  --ir-jit             experimental register-allocating IR DRC for the SH3 ALU/mem subset (interpreter fallback for the rest)\n");
     printf("  --rotate auto|none|cw|ccw|180  frontend/display orientation; auto uses cw for akatana and ccw otherwise\n");
     printf("  --video-renderer software|gles2  SDL3 video path, default software\n");
     printf("  --gles2-renderer    alias for --video-renderer gles2\n");
@@ -59,8 +61,8 @@ static void usage(void)
     printf("  --aggressive-assists  enable risky DDPSDOJ boot shims past documented blockers\n");
     printf("  --dcache              enable experimental non-coherent SH data-cache model\n");
     printf("  --strict-cache-ops    honor PREF/OCB/P4 cache-control invalidation experiments\n");
-    printf("  --mame-cache-meta     collect MAME SH7709S-style 16KiB/16B/4-way cache metadata\n");
-    printf("  --sh7709s-cache-timing add experimental MAME 2026-style SH7709S cache/memory wait penalties\n");
+    printf("  --mame-cache-meta     collect MAME SH7709S-style 16KiB/16B/4-way cache metadata (accurate build only; on by default there)\n");
+    printf("  --sh7709s-cache-timing add MAME 0.288-style SH7709S cache/memory wait penalties (accurate build only; build with 'make CACHE=accurate')\n");
     printf("  --mame-trapa          vector SH7709S TRAPA like MAME instead of diagnostic no-vector mode\n");
     printf("  --mame-speedup        emulate MAME's DDPSDOJ spin-until-interrupt speedup\n");
     printf("  --mame-full-dmatcr    use MAME's full 0x1000000 zero-DMATCR count (diagnostic)\n");
@@ -290,6 +292,7 @@ int main(int argc, char **argv)
     int headless_present_check;
     int profile_sh3_only;
     int c23_jit_requested;
+    int ir_jit_requested;
     int display_rotation_requested;
     int video_renderer_requested;
     int gles2_tile_cache_requested;
@@ -342,8 +345,11 @@ int main(int argc, char **argv)
     aggressive_assists = 0;
     dcache_requested = 0;
     strict_cache_ops = 0;
-    mame_cache_meta = 0;
-    sh7709s_cache_timing = 0;
+    /* The accurate build (CV1K_CACHE_ACCURATE) models the SH7709S cache like
+     * MAME 0.288 and enables it by default; the fast build compiles the hooks
+     * out, so these stay off. */
+    mame_cache_meta = CV1K_CACHE_ACCURATE ? 1 : 0;
+    sh7709s_cache_timing = CV1K_CACHE_ACCURATE ? 1 : 0;
     mame_trapa = 0;
     mame_speedup = 1;
     mame_full_dmatcr = 0;
@@ -359,6 +365,7 @@ int main(int argc, char **argv)
     headless_present_check = 0;
     profile_sh3_only = 0;
     c23_jit_requested = 0;
+    ir_jit_requested = 0;
     display_rotation_requested = CV1K_DISPLAY_ROT_AUTO;
     video_renderer_requested = CV1K_VIDEO_RENDERER_SOFTWARE;
     gles2_tile_cache_requested = 1;
@@ -514,6 +521,8 @@ int main(int argc, char **argv)
             else { fprintf(stderr, "unknown cpu backend: %s\n", argv[i]); return 1; }
         } else if (strcmp(argv[i], "--c23-jit") == 0) {
             c23_jit_requested = 1;
+        } else if (strcmp(argv[i], "--ir-jit") == 0) {
+            ir_jit_requested = 1;
         } else if (strcmp(argv[i], "--rotate") == 0 && i + 1 < argc) {
             i++;
             if (!cv1k_video_display_rotation_parse(argv[i], &display_rotation_requested)) {
@@ -618,6 +627,10 @@ int main(int argc, char **argv)
             sh7709s_c23jit_enable(1);
         }
     }
+    if (ir_jit_requested) {
+        cv1k_ir_enable(1);
+        m.ir_jit = 1;
+    }
 
     if (display_rotation_requested == CV1K_DISPLAY_ROT_AUTO) {
         m.display_rotation = have_report ? cv1k_video_display_rotation_auto_for_path(rr.source_path) : CV1K_DISPLAY_ROT_CCW;
@@ -679,6 +692,7 @@ int main(int argc, char **argv)
         m.mame_speedup = mame_speedup;
         m.mame_full_dmatcr = mame_full_dmatcr;
         m.mame_tmu_irq = mame_tmu_irq;
+        m.ir_jit = ir_jit_requested;
         m.render_screen = profile_sh3_only ? 0 : 1;
         m.threaded_render = threaded_render_requested && m.render_screen;
         m.threaded_audio = threaded_audio_requested;

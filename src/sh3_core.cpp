@@ -94,20 +94,35 @@ public:
         return 0;
     }
 
+    /* SH7709S cache-access timing hook.  In the accurate build the call is
+     * gated on the runtime flags inline so the hot RAM/ROM path pays just a
+     * predictable, never-taken branch instead of a cross-TU call on every
+     * memory access.  In the default (fast) build the whole hook compiles to
+     * nothing - see CV1K_CACHE_ACCURATE in cv1k_config.h. */
+    CV1K_ALWAYS_INLINE void cache_note(uint32_t a, int is_write, int is_fetch)
+    {
+#if CV1K_CACHE_ACCURATE
+        struct cv1k_machine *mm = bus->machine;
+        if (CV1K_UNLIKELY(mm->mame_cache_meta || mm->sh7709s_cache_timing))
+            cv1k_bus_cache_access(bus, a, is_write, is_fetch);
+#else
+        (void)a; (void)is_write; (void)is_fetch;
+#endif
+    }
     CV1K_ALWAYS_INLINE uint8_t  read_byte(uint32_t a)
-    { cv1k_u8 *p = hot_ptr(a, 0, 1); if (p) { cv1k_bus_cache_access(bus, a, 0, 0); return *p; } return cv1k_bus_read8(bus, a); }
+    { cv1k_u8 *p = hot_ptr(a, 0, 1); if (p) { cache_note(a, 0, 0); return *p; } return cv1k_bus_read8(bus, a); }
     CV1K_ALWAYS_INLINE uint16_t read_word(uint32_t a)
-    { cv1k_u8 *p = hot_ptr(a, 0, 2); if (p) { cv1k_bus_cache_access(bus, a, 0, 0); return (uint16_t)(((uint16_t)p[0] << 8) | p[1]); } return cv1k_bus_read16(bus, a); }
+    { cv1k_u8 *p = hot_ptr(a, 0, 2); if (p) { cache_note(a, 0, 0); return (uint16_t)(((uint16_t)p[0] << 8) | p[1]); } return cv1k_bus_read16(bus, a); }
     CV1K_ALWAYS_INLINE uint32_t read_long(uint32_t a)
-    { cv1k_u8 *p = hot_ptr(a, 0, 4); if (p) { cv1k_bus_cache_access(bus, a, 0, 0); return (((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]); } return cv1k_bus_read32(bus, a); }
+    { cv1k_u8 *p = hot_ptr(a, 0, 4); if (p) { cache_note(a, 0, 0); return (((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]); } return cv1k_bus_read32(bus, a); }
     CV1K_ALWAYS_INLINE void     write_byte(uint32_t a, uint8_t d)
-    { cv1k_u8 *p = hot_ptr(a, 1, 1); if (p) { cv1k_bus_cache_access(bus, a, 1, 0); *p = d; } else cv1k_bus_write8(bus, a, d); }
+    { cv1k_u8 *p = hot_ptr(a, 1, 1); if (p) { cache_note(a, 1, 0); *p = d; } else cv1k_bus_write8(bus, a, d); }
     CV1K_ALWAYS_INLINE void     write_word(uint32_t a, uint16_t d)
-    { cv1k_u8 *p = hot_ptr(a, 1, 2); if (p) { cv1k_bus_cache_access(bus, a, 1, 0); p[0] = (cv1k_u8)(d >> 8); p[1] = (cv1k_u8)d; } else cv1k_bus_write16(bus, a, d); }
+    { cv1k_u8 *p = hot_ptr(a, 1, 2); if (p) { cache_note(a, 1, 0); p[0] = (cv1k_u8)(d >> 8); p[1] = (cv1k_u8)d; } else cv1k_bus_write16(bus, a, d); }
     CV1K_ALWAYS_INLINE void     write_long(uint32_t a, uint32_t d)
-    { cv1k_u8 *p = hot_ptr(a, 1, 4); if (p) { cv1k_bus_cache_access(bus, a, 1, 0); p[0] = (cv1k_u8)(d >> 24); p[1] = (cv1k_u8)(d >> 16); p[2] = (cv1k_u8)(d >> 8); p[3] = (cv1k_u8)d; } else cv1k_bus_write32(bus, a, d); }
+    { cv1k_u8 *p = hot_ptr(a, 1, 4); if (p) { cache_note(a, 1, 0); p[0] = (cv1k_u8)(d >> 24); p[1] = (cv1k_u8)(d >> 16); p[2] = (cv1k_u8)(d >> 8); p[3] = (cv1k_u8)d; } else cv1k_bus_write32(bus, a, d); }
     CV1K_ALWAYS_INLINE uint16_t fetch_word(uint32_t a)
-    { cv1k_u8 *p = hot_ptr(a, 0, 2); if (p) { cv1k_bus_cache_access(bus, a, 0, 1); return (uint16_t)(((uint16_t)p[0] << 8) | p[1]); } return cv1k_bus_fetch16(bus, a); }
+    { cv1k_u8 *p = hot_ptr(a, 0, 2); if (p) { cache_note(a, 0, 1); return (uint16_t)(((uint16_t)p[0] << 8) | p[1]); } return cv1k_bus_fetch16(bus, a); }
 
     /* ---- shared SH-2/3/4 interpreter (verbatim from MAME sh.cpp) ---- */
 #define m_sh2_state st
@@ -431,6 +446,9 @@ extern "C" void sh7709s_reset(struct sh7709s_cpu *cpu)
     memset(cpu, 0, sizeof(*cpu));
     cpu->pc = 0xa0000000UL;       /* SH-3 reset vector (P2 boot area) */
     cpu->sr = 0x700000f0UL;       /* MD|RB|BL, IMASK=15 */
+    /* Default idle-loop PCs (ddpdfk/ddpsdoj); romset loader overrides per game. */
+    cpu->idle_pc0 = 0x0c1d1346UL;
+    cpu->idle_pc1 = 0x0c1d1348UL;
 }
 
 static void irq_assert(struct sh7709s_cpu *cpu, cv1k_u32 event, cv1k_u32 pri)
@@ -580,7 +598,7 @@ extern "C" CV1K_HOT cv1k_u32 sh7709s_run_frame_interpreter(struct sh7709s_cpu *c
             cv1k_bus_tmu_tick(bus);
             next_tmu = cpu->cycles + tmu_interval;
         }
-        if (cpu->pc == 0x0c1d1346UL || cpu->pc == 0x0c1d1348UL) {
+        if (cpu->pc == cpu->idle_pc0 || cpu->pc == cpu->idle_pc1) {
             /* Parked in the vblank-wait spin: jump straight to the next TMU
              * boundary (or frame end), then loop so any posted timer IRQ is
              * serviced on the next step. */

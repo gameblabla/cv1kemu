@@ -19,6 +19,7 @@
 #include "emu.h"
 #include "platform.h"
 #include "sh3_jit/cv1k_sh3_c23_jit.h"
+#include "sh3_jit/cv1k_ir.h"
 #include <stddef.h>
 #include <string.h>
 
@@ -1371,6 +1372,7 @@ static void icache_prefill_block(struct cv1k_machine *m, cv1k_u32 phys)
 static void icache_invalidate_line(struct cv1k_machine *m, cv1k_u32 phys)
 {
     if (sh7709s_c23jit_enabled()) sh7709s_c23jit_reset();
+    if (cv1k_ir_enabled()) cv1k_ir_reset();
     cv1k_u32 base;
     cv1k_u32 p;
     cv1k_u32 idx;
@@ -1397,6 +1399,7 @@ void cv1k_bus_invalidate_icache_all(struct cv1k_bus *bus)
     if (m == NULL) return;
     memset(m->icache_valid, 0, sizeof(m->icache_valid));
     if (sh7709s_c23jit_enabled()) sh7709s_c23jit_reset();
+    if (cv1k_ir_enabled()) cv1k_ir_reset();
 }
 
 static void cv1k_bus_invalidate_dcache_all(struct cv1k_bus *bus)

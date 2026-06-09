@@ -229,6 +229,19 @@ static void emit_one(struct x64e *e, cv1k_u16 op, cv1k_u32 pc)
     unsigned n = (op >> 8) & 15U;
     unsigned m = (op >> 4) & 15U;
     if (op == 0x0009U) return; /* NOP */
+    /* Focused C-helper calls (exact interpreter semantics) for ops we do not
+     * emit inline; keeps blocks containing them fully compiled. */
+    if ((op & 0xf0ffU) == 0x4024U) { mov_r64_r64(e, RDI, R12); mov_r32_imm32(e, RSI, n); call_abs(e, (const void *)cv1k_sh3_jit_rotcl); return; } /* ROTCL Rn */
+    if ((op & 0xf0ffU) == 0x4025U) { mov_r64_r64(e, RDI, R12); mov_r32_imm32(e, RSI, n); call_abs(e, (const void *)cv1k_sh3_jit_rotcr); return; } /* ROTCR Rn */
+    if (op == 0x0019U)             { mov_r64_r64(e, RDI, R12); call_abs(e, (const void *)cv1k_sh3_jit_div0u); return; } /* DIV0U */
+    if ((op & 0xf00fU) == 0x2007U) { mov_r64_r64(e, RDI, R12); mov_r32_imm32(e, RSI, m); mov_r32_imm32(e, RDX, n); call_abs(e, (const void *)cv1k_sh3_jit_div0s); return; } /* DIV0S Rm,Rn */
+    if ((op & 0xf00fU) == 0x3004U) { mov_r64_r64(e, RDI, R12); mov_r32_imm32(e, RSI, m); mov_r32_imm32(e, RDX, n); call_abs(e, (const void *)cv1k_sh3_jit_div1); return; } /* DIV1 Rm,Rn */
+    if ((op & 0xf00fU) == 0x0007U) { mov_r64_r64(e, RDI, R12); mov_r32_imm32(e, RSI, m); mov_r32_imm32(e, RDX, n); call_abs(e, (const void *)cv1k_sh3_jit_mull);  return; } /* MUL.L Rm,Rn */
+    if ((op & 0xf00fU) == 0x6008U) { mov_r64_r64(e, RDI, R12); mov_r32_imm32(e, RSI, m); mov_r32_imm32(e, RDX, n); call_abs(e, (const void *)cv1k_sh3_jit_swapb); return; } /* SWAP.B Rm,Rn */
+    if ((op & 0xf00fU) == 0x6009U) { mov_r64_r64(e, RDI, R12); mov_r32_imm32(e, RSI, m); mov_r32_imm32(e, RDX, n); call_abs(e, (const void *)cv1k_sh3_jit_swapw); return; } /* SWAP.W Rm,Rn */
+    if ((op & 0xf00fU) == 0x600aU) { mov_r64_r64(e, RDI, R12); mov_r32_imm32(e, RSI, m); mov_r32_imm32(e, RDX, n); call_abs(e, (const void *)cv1k_sh3_jit_negc);  return; } /* NEGC Rm,Rn */
+    if ((op & 0xf0ffU) == 0x4004U) { mov_r64_r64(e, RDI, R12); mov_r32_imm32(e, RSI, n); call_abs(e, (const void *)cv1k_sh3_jit_rotl);  return; } /* ROTL Rn */
+    if ((op & 0xf0ffU) == 0x4005U) { mov_r64_r64(e, RDI, R12); mov_r32_imm32(e, RSI, n); call_abs(e, (const void *)cv1k_sh3_jit_rotr);  return; } /* ROTR Rn */
     if ((op & 0xf000U) == 0xe000U) { mov_m32_imm32(e, OFF_R(n), (uint32_t)sext8(op)); return; }
     if ((op & 0xf000U) == 0x7000U) { add_m32_imm32(e, OFF_R(n), (uint32_t)sext8(op)); return; }
     if ((op & 0xf00fU) == 0x6003U) { mov_r32_m32(e, RAX, OFF_R(m)); mov_m32_r32(e, OFF_R(n), RAX); return; }

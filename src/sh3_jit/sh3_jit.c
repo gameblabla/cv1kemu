@@ -53,6 +53,7 @@ cv1k_u32 cv1k_sh3_jit_linear_cycles(cv1k_u16 op)
     if ((op & 0xff00U) == 0xcb00U) return 3U;
     if ((op & 0xf0ffU) == 0x4017U || (op & 0xf0ffU) == 0x4027U) return 3U;
     if ((op & 0xf0ffU) == 0x4013U || (op & 0xf0ffU) == 0x4023U) return 2U;
+    if ((op & 0xf00fU) == 0x0007U) return 2U; /* MUL.L is 2 cycles */
     return 1U;
 }
 
@@ -94,45 +95,60 @@ static cv1k_u8 *hot_write_ptr(struct cv1k_bus *bus, cv1k_u32 addr, cv1k_u32 need
     return NULL;
 }
 
+/* SH7709S cache-access hook for the JIT's hot memory helpers.  Compiles to
+ * nothing in the fast build (CV1K_CACHE_ACCURATE == 0); in the accurate build it
+ * gates on the runtime flags so the common case is a predictable branch rather
+ * than a call on every JIT'd memory access. */
+static CV1K_ALWAYS_INLINE void jit_cache_note(struct cv1k_bus *bus, cv1k_u32 addr, int write, int fetch)
+{
+#if CV1K_CACHE_ACCURATE
+    struct cv1k_machine *mm = bus ? bus->machine : NULL;
+    if (CV1K_UNLIKELY(mm != NULL && (mm->mame_cache_meta || mm->sh7709s_cache_timing)))
+        cv1k_bus_cache_access(bus, addr, write, fetch);
+#else
+    (void)bus; (void)addr; (void)write; (void)fetch;
+#endif
+}
+
 cv1k_u8 cv1k_sh3_jit_read8(struct cv1k_bus *bus, cv1k_u32 addr)
 {
     cv1k_u8 *p = hot_read_ptr(bus, addr, 1U);
-    if (p) { cv1k_bus_cache_access(bus, addr, 0, 0); return p[0]; }
+    if (p) { jit_cache_note(bus, addr, 0, 0); return p[0]; }
     return cv1k_bus_read8(bus, addr);
 }
 
 cv1k_u16 cv1k_sh3_jit_read16(struct cv1k_bus *bus, cv1k_u32 addr)
 {
     cv1k_u8 *p = hot_read_ptr(bus, addr, 2U);
-    if (p) { cv1k_bus_cache_access(bus, addr, 0, 0); return (cv1k_u16)(((cv1k_u16)p[0] << 8) | p[1]); }
+    if (p) { jit_cache_note(bus, addr, 0, 0); return (cv1k_u16)(((cv1k_u16)p[0] << 8) | p[1]); }
     return cv1k_bus_read16(bus, addr);
 }
 
 cv1k_u32 cv1k_sh3_jit_read32(struct cv1k_bus *bus, cv1k_u32 addr)
 {
     cv1k_u8 *p = hot_read_ptr(bus, addr, 4U);
-    if (p) { cv1k_bus_cache_access(bus, addr, 0, 0); return (((cv1k_u32)p[0] << 24) | ((cv1k_u32)p[1] << 16) | ((cv1k_u32)p[2] << 8) | p[3]); }
+    if (p) { jit_cache_note(bus, addr, 0, 0); return (((cv1k_u32)p[0] << 24) | ((cv1k_u32)p[1] << 16) | ((cv1k_u32)p[2] << 8) | p[3]); }
     return cv1k_bus_read32(bus, addr);
 }
 
 void cv1k_sh3_jit_write8(struct cv1k_bus *bus, cv1k_u32 addr, cv1k_u32 data)
 {
     cv1k_u8 *p = hot_write_ptr(bus, addr, 1U);
-    if (p) { cv1k_bus_cache_access(bus, addr, 1, 0); p[0] = (cv1k_u8)data; }
+    if (p) { jit_cache_note(bus, addr, 1, 0); p[0] = (cv1k_u8)data; }
     else cv1k_bus_write8(bus, addr, (cv1k_u8)data);
 }
 
 void cv1k_sh3_jit_write16(struct cv1k_bus *bus, cv1k_u32 addr, cv1k_u32 data)
 {
     cv1k_u8 *p = hot_write_ptr(bus, addr, 2U);
-    if (p) { cv1k_bus_cache_access(bus, addr, 1, 0); p[0] = (cv1k_u8)(data >> 8); p[1] = (cv1k_u8)data; }
+    if (p) { jit_cache_note(bus, addr, 1, 0); p[0] = (cv1k_u8)(data >> 8); p[1] = (cv1k_u8)data; }
     else cv1k_bus_write16(bus, addr, (cv1k_u16)data);
 }
 
 void cv1k_sh3_jit_write32(struct cv1k_bus *bus, cv1k_u32 addr, cv1k_u32 data)
 {
     cv1k_u8 *p = hot_write_ptr(bus, addr, 4U);
-    if (p) { cv1k_bus_cache_access(bus, addr, 1, 0); p[0] = (cv1k_u8)(data >> 24); p[1] = (cv1k_u8)(data >> 16); p[2] = (cv1k_u8)(data >> 8); p[3] = (cv1k_u8)data; }
+    if (p) { jit_cache_note(bus, addr, 1, 0); p[0] = (cv1k_u8)(data >> 24); p[1] = (cv1k_u8)(data >> 16); p[2] = (cv1k_u8)(data >> 8); p[3] = (cv1k_u8)data; }
     else cv1k_bus_write32(bus, addr, data);
 }
 
@@ -161,6 +177,112 @@ void cv1k_sh3_jit_rte(struct sh7709s_cpu *cpu)
         }
     }
     cpu->sr = cpu->ssr;
+}
+
+/* Verbatim copies of the MAME SH interpreter ops (src/sh_common_ops.inc) so the
+ * JIT can emit a focused call instead of failing the whole block.  Keep these
+ * bit-exact with the interpreter. */
+void cv1k_sh3_jit_rotcl(struct sh7709s_cpu *cpu, cv1k_u32 n)
+{
+    cv1k_u32 temp = (cpu->r[n] >> 31) & SH_T;
+    cpu->r[n] = (cpu->r[n] << 1) | (cpu->sr & SH_T);
+    cpu->sr = (cpu->sr & ~SH_T) | temp;
+}
+
+void cv1k_sh3_jit_rotcr(struct sh7709s_cpu *cpu, cv1k_u32 n)
+{
+    cv1k_u32 temp = (cpu->sr & SH_T) << 31;
+    if (cpu->r[n] & SH_T) cpu->sr |= SH_T; else cpu->sr &= ~SH_T;
+    cpu->r[n] = (cpu->r[n] >> 1) | temp;
+}
+
+void cv1k_sh3_jit_div0s(struct sh7709s_cpu *cpu, cv1k_u32 m, cv1k_u32 n)
+{
+    if (!((cpu->r[n] >> 31) & 1U)) cpu->sr &= ~SH_Q; else cpu->sr |= SH_Q;
+    if (!((cpu->r[m] >> 31) & 1U)) cpu->sr &= ~SH_M; else cpu->sr |= SH_M;
+    if (((cpu->r[m] ^ cpu->r[n]) >> 31) & 1U) cpu->sr |= SH_T; else cpu->sr &= ~SH_T;
+}
+
+void cv1k_sh3_jit_div0u(struct sh7709s_cpu *cpu)
+{
+    cpu->sr &= ~(SH_M | SH_Q | SH_T);
+}
+
+void cv1k_sh3_jit_div1(struct sh7709s_cpu *cpu, cv1k_u32 m, cv1k_u32 n)
+{
+    cv1k_u32 old_q = cpu->sr & SH_Q;
+    if (0x80000000U & cpu->r[n]) cpu->sr |= SH_Q; else cpu->sr &= ~SH_Q;
+
+    cpu->r[n] = (cpu->r[n] << 1) | (cpu->sr & SH_T);
+
+    if (!old_q) {
+        if (!(cpu->sr & SH_M)) {
+            cv1k_u32 tmp = cpu->r[n];
+            cpu->r[n] -= cpu->r[m];
+            if (!(cpu->sr & SH_Q)) { if (cpu->r[n] > tmp) cpu->sr |= SH_Q; else cpu->sr &= ~SH_Q; }
+            else                   { if (cpu->r[n] > tmp) cpu->sr &= ~SH_Q; else cpu->sr |= SH_Q; }
+        } else {
+            cv1k_u32 tmp = cpu->r[n];
+            cpu->r[n] += cpu->r[m];
+            if (!(cpu->sr & SH_Q)) { if (cpu->r[n] < tmp) cpu->sr &= ~SH_Q; else cpu->sr |= SH_Q; }
+            else                   { if (cpu->r[n] < tmp) cpu->sr |= SH_Q; else cpu->sr &= ~SH_Q; }
+        }
+    } else {
+        if (!(cpu->sr & SH_M)) {
+            cv1k_u32 tmp = cpu->r[n];
+            cpu->r[n] += cpu->r[m];
+            if (!(cpu->sr & SH_Q)) { if (cpu->r[n] < tmp) cpu->sr |= SH_Q; else cpu->sr &= ~SH_Q; }
+            else                   { if (cpu->r[n] < tmp) cpu->sr &= ~SH_Q; else cpu->sr |= SH_Q; }
+        } else {
+            cv1k_u32 tmp = cpu->r[n];
+            cpu->r[n] -= cpu->r[m];
+            if (!(cpu->sr & SH_Q)) { if (cpu->r[n] > tmp) cpu->sr &= ~SH_Q; else cpu->sr |= SH_Q; }
+            else                   { if (cpu->r[n] > tmp) cpu->sr |= SH_Q; else cpu->sr &= ~SH_Q; }
+        }
+    }
+
+    {
+        cv1k_u32 tmp = (cpu->sr & (SH_Q | SH_M));
+        if (tmp == 0U || tmp == 0x300U) cpu->sr |= SH_T; else cpu->sr &= ~SH_T;
+    }
+}
+
+void cv1k_sh3_jit_mull(struct sh7709s_cpu *cpu, cv1k_u32 m, cv1k_u32 n)
+{
+    cpu->macl = cpu->r[n] * cpu->r[m];
+}
+
+void cv1k_sh3_jit_negc(struct sh7709s_cpu *cpu, cv1k_u32 m, cv1k_u32 n)
+{
+    cv1k_u32 temp = cpu->r[m];
+    cpu->r[n] = (cv1k_u32)(0U - temp - (cpu->sr & SH_T));
+    if (temp || (cpu->sr & SH_T)) cpu->sr |= SH_T; else cpu->sr &= ~SH_T;
+}
+
+void cv1k_sh3_jit_swapb(struct sh7709s_cpu *cpu, cv1k_u32 m, cv1k_u32 n)
+{
+    cv1k_u32 temp = cpu->r[m] & 0xffff0000U;
+    temp |= (cpu->r[m] & 0x000000ffU) << 8;
+    cpu->r[n] = (cv1k_u8)(cpu->r[m] >> 8);
+    cpu->r[n] = cpu->r[n] | temp;
+}
+
+void cv1k_sh3_jit_swapw(struct sh7709s_cpu *cpu, cv1k_u32 m, cv1k_u32 n)
+{
+    cv1k_u32 temp = cpu->r[m] >> 16;
+    cpu->r[n] = (cpu->r[m] << 16) | temp;
+}
+
+void cv1k_sh3_jit_rotl(struct sh7709s_cpu *cpu, cv1k_u32 n)
+{
+    cpu->sr = (cpu->sr & ~SH_T) | ((cpu->r[n] >> 31) & SH_T);
+    cpu->r[n] = (cpu->r[n] << 1) | (cpu->r[n] >> 31);
+}
+
+void cv1k_sh3_jit_rotr(struct sh7709s_cpu *cpu, cv1k_u32 n)
+{
+    cpu->sr = (cpu->sr & ~SH_T) | (cpu->r[n] & SH_T);
+    cpu->r[n] = (cpu->r[n] >> 1) | (cpu->r[n] << 31);
 }
 
 int cv1k_sh3_jit_is_terminal_branch(cv1k_u16 op)
@@ -212,6 +334,10 @@ int cv1k_sh3_jit_supported_linear(cv1k_u16 op)
     case 0x6004U: case 0x6005U: case 0x6006U: case 0x2004U: case 0x2005U: case 0x2006U:
     case 0x000cU: case 0x000dU: case 0x000eU: case 0x0004U: case 0x0005U: case 0x0006U:
     case 0x400cU: case 0x400dU:
+    case 0x3004U: case 0x2007U: /* DIV1, DIV0S via focused C helper */
+    case 0x0007U:               /* MUL.L via focused C helper */
+    case 0x6008U: case 0x6009U: case 0x600aU: /* SWAP.B, SWAP.W, NEGC via helper */
+    case 0x4004U: case 0x4005U: /* ROTL, ROTR via focused C helper */
         return 1;
     default:
         break;
@@ -225,6 +351,8 @@ int cv1k_sh3_jit_supported_linear(cv1k_u16 op)
     case 0x4010U: case 0x4011U: case 0x4015U: case 0x4000U: case 0x4001U: case 0x4020U: case 0x4021U:
     case 0x4008U: case 0x4009U: case 0x4018U: case 0x4019U: case 0x4028U: case 0x4029U:
     case 0x401eU: case 0x402eU:
+    case 0x4024U: case 0x4025U: /* ROTCL, ROTCR via focused C helper */
+    case 0x0019U:               /* DIV0U via focused C helper */
         return 1;
     default:
         return 0;
@@ -291,6 +419,21 @@ static struct cv1k_sh3_jit_block *get_block(struct cv1k_bus *bus, cv1k_u32 pc)
 {
     struct cv1k_sh3_jit_block *b = lookup_block(pc);
     return b ? b : compile_block(bus, pc);
+}
+
+/* TEST-ONLY differential-tester entry: compile a fresh block at cpu->pc and run
+ * it once.  Returns the number of guest ops the block covered, or 0 if the block
+ * could not be JIT-compiled.  Used by tools/jit_difftest to assert the JIT block
+ * produces the same architectural state as interpreting the same ops. */
+cv1k_u32 cv1k_sh3_jit_test_run_block(struct sh7709s_cpu *cpu, struct cv1k_bus *bus)
+{
+    struct cv1k_sh3_jit_block *b;
+    if (cpu == NULL || bus == NULL) return 0;
+    if (g_backend == NULL) g_backend = cv1k_sh3_jit_select_backend();
+    b = compile_block(bus, cpu->pc);
+    if (b == NULL || b->negative || b->fn == NULL) return 0;
+    b->fn(cpu, bus);
+    return b->op_count;
 }
 
 static inline int jit_state_ok(const struct sh7709s_cpu *cpu)
@@ -407,6 +550,7 @@ cv1k_u32 sh7709s_c23jit_run_frame(struct sh7709s_cpu *cpu, struct cv1k_bus *bus,
             const cv1k_u32 to_tmu = next_tmu - cpu->cycles;
             if (b != NULL && !b->negative && b->fn != NULL && b->cycles != 0U && b->cycles < to_tmu) {
                 cv1k_u32 ran;
+#if CV1K_CACHE_ACCURATE
                 {
                     struct cv1k_machine *mm = bus ? bus->machine : NULL;
                     if (mm != NULL && (mm->mame_cache_meta || mm->sh7709s_cache_timing)) {
@@ -416,6 +560,7 @@ cv1k_u32 sh7709s_c23jit_run_frame(struct sh7709s_cpu *cpu, struct cv1k_bus *bus,
                         }
                     }
                 }
+#endif
                 g_executing_blocks++;
                 ran = b->fn(cpu, bus);
                 if (g_executing_blocks != 0U) g_executing_blocks--;
@@ -443,7 +588,7 @@ cv1k_u32 sh7709s_c23jit_run_frame(struct sh7709s_cpu *cpu, struct cv1k_bus *bus,
             cv1k_bus_tmu_tick(bus);
             next_tmu = cpu->cycles + tmu_interval;
         }
-        if (cpu->pc == 0x0c1d1346UL || cpu->pc == 0x0c1d1348UL) {
+        if (cpu->pc == cpu->idle_pc0 || cpu->pc == cpu->idle_pc1) {
             cv1k_u32 jump = ((cv1k_s32)(next_tmu - frame_end) < 0) ? next_tmu : frame_end;
             if ((cv1k_s32)(jump - cpu->cycles) > 0) cpu->cycles = jump;
             if ((cv1k_s32)(cpu->cycles - next_tmu) >= 0) {

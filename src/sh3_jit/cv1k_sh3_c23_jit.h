@@ -23,6 +23,11 @@ cv1k_u32 sh7709s_c23jit_run_frame(struct sh7709s_cpu *cpu, struct cv1k_bus *bus,
 void sh7709s_c23jit_stats(cv1k_u32 *blocks, cv1k_u32 *hits, cv1k_u32 *fallbacks,
                           cv1k_u32 *invalidations);
 
+/* TEST-ONLY: compile+run one fresh block at cpu->pc; returns ops covered (0 if
+ * not JIT-compilable).  Used by the differential tester (tools/jit_difftest.c)
+ * to assert a JIT block matches interpreting the same instructions. */
+cv1k_u32 cv1k_sh3_jit_test_run_block(struct sh7709s_cpu *cpu, struct cv1k_bus *bus);
+
 #ifdef __cplusplus
 }
 #endif

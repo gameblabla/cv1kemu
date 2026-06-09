@@ -44,6 +44,13 @@ struct sh7709s_cpu {
     cv1k_u32 sleep_mode;  /* 0 normal, 1 sleeping, 2 woke from exception */
     cv1k_u32 ppc;         /* previous PC (debug) */
     cv1k_s32 icount;      /* per-step cycle accumulator (negative = consumed) */
+    /* Per-game vblank-wait idle loop PCs (MAME cv1k install_speedups idlepc and
+     * idlepc+2).  When the main thread parks here the rest of the frame is pure
+     * spin, so the frame runners fast-forward to the next timer event instead of
+     * interpreting ~1.7M spin instructions.  Defaults to the ddpdfk set; the
+     * romset loader overrides them for the detected game. */
+    cv1k_u32 idle_pc0;
+    cv1k_u32 idle_pc1;
 };
 
 void sh7709s_reset(struct sh7709s_cpu *cpu);

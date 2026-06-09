@@ -14,6 +14,7 @@
 #include "emu.h"
 #include "platform.h"
 #include "mame_cv1k_derived.h"
+#include "sh3_jit/cv1k_ir.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +27,10 @@ int cv1k_machine_init(struct cv1k_machine *m, int model)
     cv1k_u32 ram_size;
     memset(m, 0, sizeof(*m));
     m->model = model;
+    /* Idle-loop fast-forward PCs default to ddpdfk/ddpsdoj; the romset loader
+     * overrides them for the detected game. */
+    m->idle_pc0 = 0x0c1d1346UL;
+    m->idle_pc1 = 0x0c1d1348UL;
     m->display_rotation = CV1K_DISPLAY_ROT_CCW;
     m->video_renderer = CV1K_VIDEO_RENDERER_SOFTWARE;
     m->gles2_tile_cache = 1;
@@ -882,6 +887,11 @@ void cv1k_machine_frame_advance(struct cv1k_machine *m, int render)
     if (m == NULL) return;
     cycles_before = m->cpu.cycles;
 
+    /* Keep the cpu's idle-loop PCs in sync with the detected game (a guest CPU
+     * reset zeroes the cpu state, so re-apply here every frame). */
+    m->cpu.idle_pc0 = m->idle_pc0;
+    m->cpu.idle_pc1 = m->idle_pc1;
+
     /* Run one real CV1000 video frame worth of SH-3 cycles (102.4 MHz /
      * 60.024 Hz).  With the MAME-derived core this is the natural timeslice:
      * the game runs its per-frame logic and then spins on the vblank tick
@@ -897,7 +907,7 @@ void cv1k_machine_frame_advance(struct cv1k_machine *m, int render)
         while ((cv1k_u32)(m->cpu.cycles - cycles_before) < CV1K_CYCLES_PER_VBLANK) {
             m->last_active_pc = m->cpu.pc;
             cv1k_machine_step(m);
-            if (m->cpu.pc == 0x0c1d1346UL || m->cpu.pc == 0x0c1d1348UL) {
+            if (m->cpu.pc == m->cpu.idle_pc0 || m->cpu.pc == m->cpu.idle_pc1) {
                 m->mame_speedup_spins++;
                 break;
             }
@@ -908,12 +918,13 @@ void cv1k_machine_frame_advance(struct cv1k_machine *m, int render)
         /* Sound path: run the full frame, ticking the TMU finely so the sound
          * timer ISR fires at its true rate.  No idle skip (the ISR must keep
          * running while the main thread spins in its vblank wait). */
-        sh7709s_run_frame(&m->cpu, &m->bus, CV1K_CYCLES_PER_VBLANK, 2048UL);
+        if (m->ir_jit) cv1k_irjit_run_frame(&m->cpu, &m->bus, CV1K_CYCLES_PER_VBLANK, 2048UL);
+        else sh7709s_run_frame(&m->cpu, &m->bus, CV1K_CYCLES_PER_VBLANK, 2048UL);
         m->last_active_pc = m->cpu.pc;
     } else {
         /* Silent fast path: jump straight to vsync once the game parks in its
          * vblank-wait idle loop. */
-        sh7709s_run_until_idle(&m->cpu, &m->bus, CV1K_CYCLES_PER_VBLANK, 0x0c1d1346UL, 0x0c1d1348UL);
+        sh7709s_run_until_idle(&m->cpu, &m->bus, CV1K_CYCLES_PER_VBLANK, m->cpu.idle_pc0, m->cpu.idle_pc1);
         cv1k_bus_tmu_tick(&m->bus);
         m->last_active_pc = m->cpu.pc;
     }
