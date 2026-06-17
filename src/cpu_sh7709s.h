@@ -60,6 +60,13 @@ void sh7709s_request_irq_event(struct sh7709s_cpu *cpu, cv1k_u32 event, int prio
 void sh7709s_clear_irq_event(struct sh7709s_cpu *cpu, cv1k_u32 event);
 int sh7709s_accept_pending_irq(struct sh7709s_cpu *cpu, struct cv1k_bus *bus);
 int sh7709s_step(struct sh7709s_cpu *cpu, struct cv1k_bus *bus);
+/* Execute a predecoded, straight-line opcode span.  Used by the wasm block-JIT
+ * backend so browser builds can cache guest fetch/decode while preserving the
+ * exact MAME-derived per-op semantics.  The span must not contain delay-slot or
+ * PC-changing control-flow ops.  The runner still tests IRQ acceptance after
+ * each opcode and stops early if an interrupt vectors. */
+cv1k_u32 sh7709s_run_linear_ops(struct sh7709s_cpu *cpu, struct cv1k_bus *bus,
+                                const cv1k_u16 *ops, cv1k_u32 op_count);
 void sh7709s_run(struct sh7709s_cpu *cpu, struct cv1k_bus *bus, cv1k_u32 instructions);
 cv1k_u32 sh7709s_run_until_idle(struct sh7709s_cpu *cpu, struct cv1k_bus *bus,
                                 cv1k_u32 cycle_budget, cv1k_u32 idle_pc0, cv1k_u32 idle_pc1);

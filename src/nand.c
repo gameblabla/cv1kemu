@@ -133,6 +133,81 @@ void cv1k_nand_set_id(struct cv1k_nand *nand, cv1k_u8 manufacturer, cv1k_u8 devi
     nand->id[1] = device;
 }
 
+
+int cv1k_nand_data_read_bulk(struct cv1k_nand *nand, cv1k_u8 *dst, cv1k_u32 count)
+{
+    cv1k_u32 pages;
+    cv1k_u32 start_byte;
+    cv1k_u32 remaining;
+    cv1k_u32 copied;
+    cv1k_u32 page;
+    cv1k_u32 valid;
+    cv1k_u32 spare0;
+    cv1k_u32 spare1;
+    cv1k_u32 spare_add;
+
+    if (nand == NULL || dst == NULL || count == 0UL) return 0;
+    if (nand->data == NULL || nand->size == 0UL) return 0;
+    if (nand->mode != CV1K_NAND_SM_READ && nand->mode != CV1K_NAND_SM_RANDOM_DATA_OUTPUT) return 0;
+    if (nand->mode_3065) return 0;
+
+    pages = total_pages(nand);
+    if (pages == 0UL) pages = 1UL;
+    page = nand->page_addr % pages;
+    start_byte = nand->byte_addr;
+    remaining = count;
+    copied = 0UL;
+
+    while (remaining != 0UL) {
+        cv1k_u32 pos;
+        cv1k_u32 chunk;
+        pos = start_byte + copied;
+        chunk = remaining;
+        if (pos < CV1K_NAND_PAGE_TOTAL) {
+            valid = CV1K_NAND_PAGE_TOTAL - pos;
+            if (chunk > valid) chunk = valid;
+            if (nand->page_addr < pages) {
+                const cv1k_u8 *src;
+                src = nand->data + ((page * CV1K_NAND_PAGE_TOTAL + pos) % nand->size);
+                if (nand->data_only_reads && pos >= CV1K_NAND_PAGE_SIZE) {
+                    memset(dst + copied, 0xff, (size_t)chunk);
+                } else if (nand->data_only_reads && pos + chunk > CV1K_NAND_PAGE_SIZE) {
+                    cv1k_u32 data_chunk;
+                    data_chunk = CV1K_NAND_PAGE_SIZE - pos;
+                    memcpy(dst + copied, src, (size_t)data_chunk);
+                    memset(dst + copied + data_chunk, 0xff, (size_t)(chunk - data_chunk));
+                } else {
+                    memcpy(dst + copied, src, (size_t)chunk);
+                }
+            } else {
+                memset(dst + copied, 0xff, (size_t)chunk);
+            }
+        } else {
+            memset(dst + copied, 0xff, (size_t)chunk);
+        }
+        copied += chunk;
+        remaining -= chunk;
+    }
+
+    spare_add = 0UL;
+    if (start_byte < CV1K_NAND_PAGE_TOTAL && count != 0UL) {
+        spare0 = start_byte;
+        spare1 = start_byte + count;
+        if (spare0 < CV1K_NAND_PAGE_SIZE) spare0 = CV1K_NAND_PAGE_SIZE;
+        if (spare1 > CV1K_NAND_PAGE_TOTAL) spare1 = CV1K_NAND_PAGE_TOTAL;
+        if (spare1 > spare0) spare_add = spare1 - spare0;
+    }
+
+    nand->last_read_page = page;
+    nand->last_read_block = page / CV1K_NAND_PAGES_PER_BLOCK;
+    nand->last_read_column = start_byte + count - 1UL;
+    nand->spare_reads += spare_add;
+    nand->byte_addr = start_byte + count;
+    sync_cursor_from_mame_state(nand);
+    nand->reads += count;
+    return 1;
+}
+
 cv1k_u8 cv1k_nand_data_r(struct cv1k_nand *nand)
 {
     cv1k_u8 reply;

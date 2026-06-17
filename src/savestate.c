@@ -217,6 +217,7 @@ int cv1k_save_state(struct cv1k_machine *m, const char *path)
     if (!write_u32(f, (cv1k_u32)m->mame_speedup)) { fclose(f); return 0; }
     if (!write_u32(f, (cv1k_u32)m->mame_full_dmatcr)) { fclose(f); return 0; }
     if (!write_u32(f, (cv1k_u32)m->mame_tmu_irq)) { fclose(f); return 0; }
+    if (!write_u32(f, (cv1k_u32)m->tmu_irq_defer_frames)) { fclose(f); return 0; }
     if (!write_u32(f, m->mame_speedup_spins)) { fclose(f); return 0; }
     if (!write_block(f, m->tmu_underflows, (cv1k_u32)sizeof(m->tmu_underflows))) { fclose(f); return 0; }
     if (!write_u32(f, m->tmu_last_event) || !write_u32(f, m->tmu_last_priority)) { fclose(f); return 0; }
@@ -312,6 +313,8 @@ int cv1k_load_state(struct cv1k_machine *m, const char *path)
     m->mame_full_dmatcr = (int)size;
     if (!read_u32(f, &size)) { fclose(f); return 0; }
     m->mame_tmu_irq = (int)size;
+    if (!read_u32(f, &size)) { fclose(f); return 0; }
+    m->tmu_irq_defer_frames = size;
     if (!read_u32(f, &m->mame_speedup_spins)) { fclose(f); return 0; }
     if (!read_block(f, m->tmu_underflows, (cv1k_u32)sizeof(m->tmu_underflows))) { fclose(f); return 0; }
     if (!read_u32(f, &m->tmu_last_event) || !read_u32(f, &m->tmu_last_priority)) { fclose(f); return 0; }

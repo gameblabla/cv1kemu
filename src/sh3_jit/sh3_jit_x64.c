@@ -7,6 +7,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/mman.h>
 #include <unistd.h>
@@ -40,7 +47,9 @@ struct x64e {
 
 static void *jit_alloc(size_t cap)
 {
-#if (defined(__x86_64__) || defined(_M_X64)) && !defined(_WIN32) && (defined(__unix__) || defined(__APPLE__))
+#if (defined(__x86_64__) || defined(_M_X64)) && defined(_WIN32)
+    return VirtualAlloc(NULL, cap, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+#elif (defined(__x86_64__) || defined(_M_X64)) && (defined(__unix__) || defined(__APPLE__))
     size_t pagesz = (size_t)sysconf(_SC_PAGESIZE);
     cap = (cap + pagesz - 1U) & ~(pagesz - 1U);
     void *p = mmap(NULL, cap, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -53,7 +62,10 @@ static void *jit_alloc(size_t cap)
 
 static void jit_free(void *p, size_t cap)
 {
-#if (defined(__x86_64__) || defined(_M_X64)) && !defined(_WIN32) && (defined(__unix__) || defined(__APPLE__))
+#if (defined(__x86_64__) || defined(_M_X64)) && defined(_WIN32)
+    (void)cap;
+    if (p != NULL) VirtualFree(p, 0, MEM_RELEASE);
+#elif (defined(__x86_64__) || defined(_M_X64)) && (defined(__unix__) || defined(__APPLE__))
     if (p != NULL && cap != 0U) {
         size_t pagesz = (size_t)sysconf(_SC_PAGESIZE);
         cap = (cap + pagesz - 1U) & ~(pagesz - 1U);

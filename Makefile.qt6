@@ -1,0 +1,99 @@
+CC ?= cc
+CXX ?= c++
+CFLAGS ?= -std=gnu23 -Wall -Wextra -Wno-gnu-case-range -O3 -g3 -DNDEBUG -fomit-frame-pointer -fno-semantic-interposition -fipa-pta -fno-math-errno -fvisibility=hidden
+CXXFLAGS ?= -std=c++17 -Wall -Wextra -O3 -g3 -DNDEBUG -fomit-frame-pointer -fno-semantic-interposition -fno-math-errno
+LDFLAGS ?=
+HOST_TUNE ?= native
+ifeq ($(HOST_TUNE),native)
+override CFLAGS += -march=native -mtune=native -fno-plt
+override CXXFLAGS += -march=native -mtune=native -fno-plt
+endif
+THREADS ?= 1
+ifeq ($(THREADS),1)
+THREAD_CFLAGS = -DCV1K_ENABLE_THREADS
+THREAD_LIBS = -pthread
+else
+THREAD_CFLAGS =
+THREAD_LIBS =
+endif
+ZLIB_CFLAGS ?= $(shell pkg-config --cflags zlib 2>/dev/null)
+ZLIB_LIBS ?= $(shell pkg-config --libs zlib 2>/dev/null || echo -lz)
+QT6_PKGS ?= Qt6Widgets Qt6Gui Qt6Core Qt6Multimedia
+QT6_CFLAGS ?= $(shell pkg-config --cflags $(QT6_PKGS) 2>/dev/null)
+QT6_LIBS ?= $(shell pkg-config --libs $(QT6_PKGS) 2>/dev/null)
+QT6_SDL3_INPUT ?= auto
+SDL3_PKG ?= sdl3
+SDL3_CFLAGS ?= $(shell pkg-config --cflags $(SDL3_PKG) 2>/dev/null)
+SDL3_LIBS ?= $(shell pkg-config --libs $(SDL3_PKG) 2>/dev/null)
+ifeq ($(QT6_SDL3_INPUT),1)
+QT6_INPUT_CFLAGS = -DCV1K_QT6_WITH_SDL3_INPUT $(SDL3_CFLAGS)
+QT6_INPUT_LIBS = $(SDL3_LIBS)
+else ifeq ($(QT6_SDL3_INPUT),auto)
+HAVE_SDL3 := $(shell pkg-config --exists $(SDL3_PKG) 2>/dev/null && echo 1)
+ifeq ($(HAVE_SDL3),1)
+QT6_INPUT_CFLAGS = -DCV1K_QT6_WITH_SDL3_INPUT $(SDL3_CFLAGS)
+QT6_INPUT_LIBS = $(SDL3_LIBS)
+else
+QT6_INPUT_CFLAGS =
+QT6_INPUT_LIBS =
+endif
+else
+QT6_INPUT_CFLAGS =
+QT6_INPUT_LIBS =
+endif
+
+CORE_SRC = \
+ src/platform.c \
+ src/cv1k_frontend.c \
+ src/mame_cv1k_derived.c \
+ src/mame_mpeg_audio.c \
+ src/ymz770_mame_audio.c \
+ src/sh3_core.c \
+ src/bus.c \
+ src/emu.c \
+ src/nand.c \
+ src/rtc9701.c \
+ src/sound_ymz770.c \
+ src/video.c \
+ src/zmbv_recorder.c \
+ src/video_gles2.c \
+ src/input.c \
+ src/savestate.c \
+ src/romset.c \
+ src/sh3_jit/sh3_jit.c \
+ src/sh3_jit/sh3_jit_x64.c \
+ src/sh3_jit/cv1k_ir.c \
+ src/threaded_runtime.c \
+ src/ui_tui.c \
+ src/ui_sdl3.c \
+ src/ui_sdl12.c
+
+CORE_OBJ = $(CORE_SRC:.c=.qt6.o)
+QT_OBJ = src/qt6/cv1k_qt6_main.qt6.o
+BIN = cv1k_qt6
+
+all: $(BIN)
+
+ifneq ($(QT6_NO_PKGCONFIG),1)
+check-qt6:
+	@pkg-config --exists $(QT6_PKGS) || { echo "error: Qt6 development packages not found. Install Qt6Widgets/Qt6Gui/Qt6Core/Qt6Multimedia pkg-config files, or set QT6_NO_PKGCONFIG=1 with QT6_CFLAGS/QT6_LIBS manually."; exit 2; }
+else
+check-qt6:
+	@true
+endif
+
+$(CORE_OBJ): check-qt6
+
+$(BIN): $(CORE_OBJ) $(QT_OBJ)
+	$(CXX) $(CXXFLAGS) -o $@ $(CORE_OBJ) $(QT_OBJ) $(LDFLAGS) $(ZLIB_LIBS) $(QT6_LIBS) $(QT6_INPUT_LIBS) $(THREAD_LIBS) -lm
+
+%.qt6.o: %.c
+	$(CC) $(CFLAGS) $(THREAD_CFLAGS) $(ZLIB_CFLAGS) -DCV1K_WITH_ZLIB -Isrc -c $< -o $@
+
+src/qt6/cv1k_qt6_main.qt6.o: src/qt6/cv1k_qt6_main.cpp check-qt6
+	$(CXX) $(CXXFLAGS) $(QT6_CFLAGS) $(QT6_INPUT_CFLAGS) -Isrc -c $< -o $@
+
+clean:
+	rm -f $(CORE_OBJ) $(QT_OBJ) $(BIN)
+
+.PHONY: all clean check-qt6

@@ -32,9 +32,86 @@
 #define cv1k_mame_add5(x,y) CV1K_ADD5((x),(y))
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
+#include <stdlib.h>
+#if defined(__SSE2__)
+#include <immintrin.h>
+#endif
+
+/* Upload nonzero pixel totals are status diagnostics only; they are not used
+ * by emulation, video output, timing, save states, or audio.  Keep them opt-in
+ * because counting every uploaded 1555 pixel is a measurable SDL gameplay cost. */
+#ifndef CV1K_VIDEO_DIAG_UPLOAD_COUNTS
+#define CV1K_VIDEO_DIAG_UPLOAD_COUNTS 0
+#endif
+#ifndef CV1K_VIDEO_DIAG_DRAW_COUNTS
+#define CV1K_VIDEO_DIAG_DRAW_COUNTS 0
+#endif
+#ifndef CV1K_VIDEO_DIAG_FRAME_COUNTS
+#define CV1K_VIDEO_DIAG_FRAME_COUNTS 0
+#endif
 
 static alignas(CV1K_CACHE_ALIGN) cv1k_u32 cv1k_rgb1555_table[65536];
 static cv1k_u8 cv1k_rgb1555_table_ready;
+
+static alignas(CV1K_CACHE_ALIGN) cv1k_u8 cv1k_blend_s0d4_lut[32][32][1024];
+static cv1k_u8 cv1k_blend_s0d4_lut_ready[32][32];
+
+#ifndef CV1K_VIDEO_DRAW_HIST
+#define CV1K_VIDEO_DRAW_HIST 0
+#endif
+#if CV1K_VIDEO_DRAW_HIST
+#if CV1K_VIDEO_DRAW_HIST == 1
+static unsigned long long cv1k_draw_hist_ops[65536];
+static unsigned long long cv1k_draw_hist_px[65536];
+static void cv1k_draw_hist_dump(void)
+{
+    for (int k = 0; k < 24; k++) {
+        unsigned best = 0;
+        unsigned long long bp = 0;
+        for (unsigned i = 0; i < 65536; i++) if (cv1k_draw_hist_px[i] > bp) { bp = cv1k_draw_hist_px[i]; best = i; }
+        if (bp == 0) break;
+        fprintf(stderr, "drawhist flags=%04x ops=%llu px=%llu\n", best, cv1k_draw_hist_ops[best], cv1k_draw_hist_px[best]);
+        cv1k_draw_hist_px[best] = 0;
+    }
+}
+#else
+#define CV1K_DRAW_HIST_SLOTS 8192U
+static cv1k_u32 cv1k_draw_hist_key[CV1K_DRAW_HIST_SLOTS];
+static unsigned long long cv1k_draw_hist_ops[CV1K_DRAW_HIST_SLOTS];
+static unsigned long long cv1k_draw_hist_px[CV1K_DRAW_HIST_SLOTS];
+static void cv1k_draw_hist_add(cv1k_u32 key, unsigned long long px)
+{
+    unsigned h = ((key * 2654435761U) >> 19) & (CV1K_DRAW_HIST_SLOTS - 1U);
+    for (unsigned n = 0; n < CV1K_DRAW_HIST_SLOTS; n++) {
+        unsigned i = (h + n) & (CV1K_DRAW_HIST_SLOTS - 1U);
+        if (cv1k_draw_hist_ops[i] == 0 || cv1k_draw_hist_key[i] == key) {
+            cv1k_draw_hist_key[i] = key;
+            cv1k_draw_hist_ops[i]++;
+            cv1k_draw_hist_px[i] += px;
+            return;
+        }
+    }
+}
+static void cv1k_draw_hist_dump(void)
+{
+    for (int k = 0; k < 32; k++) {
+        unsigned best = 0;
+        unsigned long long bp = 0;
+        for (unsigned i = 0; i < CV1K_DRAW_HIST_SLOTS; i++) if (cv1k_draw_hist_px[i] > bp) { bp = cv1k_draw_hist_px[i]; best = i; }
+        if (bp == 0) break;
+        fprintf(stderr, "drawhist flags=%04x alphaw=%04x ops=%llu px=%llu\n", cv1k_draw_hist_key[best] >> 16, cv1k_draw_hist_key[best] & 0xffffU, cv1k_draw_hist_ops[best], cv1k_draw_hist_px[best]);
+        cv1k_draw_hist_px[best] = 0;
+    }
+}
+#endif
+static void cv1k_draw_hist_init(void)
+{
+    static int done;
+    if (!done && getenv("CV1K_DRAW_HIST") != NULL) { done = 1; atexit(cv1k_draw_hist_dump); }
+}
+#endif
+
 
 static void cv1k_build_rgb1555_table(void)
 {
@@ -229,6 +306,78 @@ static CV1K_ALWAYS_INLINE struct cv1k_clr5 clr5_blend_smode2(struct cv1k_clr5 s,
     }
 }
 
+static const cv1k_u8 *cv1k_get_blend_s0d4_lut(cv1k_u8 src_alpha, cv1k_u8 dst_alpha)
+{
+    cv1k_u32 sa = (cv1k_u32)src_alpha & 0x1fU;
+    cv1k_u32 da = (cv1k_u32)dst_alpha & 0x1fU;
+    cv1k_u32 s, d;
+    if (!cv1k_blend_s0d4_lut_ready[sa][da]) {
+        for (s = 0UL; s < 32UL; s++) {
+            for (d = 0UL; d < 32UL; d++) {
+                cv1k_blend_s0d4_lut[sa][da][(s << 5) | d] = CV1K_ADD5(CV1K_MUL5(sa, s), CV1K_MUL5_REV(da, d));
+            }
+        }
+        cv1k_blend_s0d4_lut_ready[sa][da] = 1U;
+    }
+    return cv1k_blend_s0d4_lut[sa][da];
+}
+
+static CV1K_ALWAYS_INLINE cv1k_u16 blend_s0d1_sa0_pixel(cv1k_u16 src, cv1k_u16 dst)
+{
+    cv1k_u32 sr = (src >> 10) & 0x1fU;
+    cv1k_u32 sg = (src >> 5) & 0x1fU;
+    cv1k_u32 sb = src & 0x1fU;
+    cv1k_u32 dr = (dst >> 10) & 0x1fU;
+    cv1k_u32 dg = (dst >> 5) & 0x1fU;
+    cv1k_u32 db = dst & 0x1fU;
+    return (cv1k_u16)((src & 0x8000U) |
+        ((cv1k_u16)CV1K_MUL5(sr, dr) << 10) |
+        ((cv1k_u16)CV1K_MUL5(sg, dg) << 5) |
+        (cv1k_u16)CV1K_MUL5(sb, db));
+}
+
+static CV1K_ALWAYS_INLINE cv1k_u16 blend_s0d4_lut_pixel(cv1k_u16 src, cv1k_u16 dst, const cv1k_u8 *lut)
+{
+    cv1k_u32 sr = (src >> 10) & 0x1fU;
+    cv1k_u32 sg = (src >> 5) & 0x1fU;
+    cv1k_u32 sb = src & 0x1fU;
+    cv1k_u32 dr = (dst >> 10) & 0x1fU;
+    cv1k_u32 dg = (dst >> 5) & 0x1fU;
+    cv1k_u32 db = dst & 0x1fU;
+    return (cv1k_u16)((src & 0x8000U) |
+        ((cv1k_u16)lut[(sr << 5) | dr] << 10) |
+        ((cv1k_u16)lut[(sg << 5) | dg] << 5) |
+        (cv1k_u16)lut[(sb << 5) | db]);
+}
+
+static CV1K_ALWAYS_INLINE cv1k_u16 blend_s0d7_pixel(cv1k_u16 src, cv1k_u16 dst, cv1k_u8 src_alpha)
+{
+    cv1k_u32 sr = (src >> 10) & 0x1fU;
+    cv1k_u32 sg = (src >> 5) & 0x1fU;
+    cv1k_u32 sb = src & 0x1fU;
+    cv1k_u32 dr = (dst >> 10) & 0x1fU;
+    cv1k_u32 dg = (dst >> 5) & 0x1fU;
+    cv1k_u32 db = dst & 0x1fU;
+    return (cv1k_u16)((src & 0x8000U) |
+        ((cv1k_u16)CV1K_ADD5(CV1K_MUL5(src_alpha, sr), dr) << 10) |
+        ((cv1k_u16)CV1K_ADD5(CV1K_MUL5(src_alpha, sg), dg) << 5) |
+        (cv1k_u16)CV1K_ADD5(CV1K_MUL5(src_alpha, sb), db));
+}
+
+static CV1K_ALWAYS_INLINE cv1k_u16 blend_s0d7_sa31_pixel(cv1k_u16 src, cv1k_u16 dst)
+{
+    cv1k_u32 sr = (src >> 10) & 0x1fU;
+    cv1k_u32 sg = (src >> 5) & 0x1fU;
+    cv1k_u32 sb = src & 0x1fU;
+    cv1k_u32 dr = (dst >> 10) & 0x1fU;
+    cv1k_u32 dg = (dst >> 5) & 0x1fU;
+    cv1k_u32 db = dst & 0x1fU;
+    return (cv1k_u16)((src & 0x8000U) |
+        ((cv1k_u16)CV1K_ADD5(sr, dr) << 10) |
+        ((cv1k_u16)CV1K_ADD5(sg, dg) << 5) |
+        (cv1k_u16)CV1K_ADD5(sb, db));
+}
+
 static CV1K_ALWAYS_INLINE cv1k_u16 blend_pixel(cv1k_u16 src, cv1k_u16 dst, cv1k_u8 src_alpha, cv1k_u8 dst_alpha, int src_mode, int dst_mode)
 {
     struct cv1k_clr5 s;
@@ -278,6 +427,186 @@ static CV1K_ALWAYS_INLINE cv1k_u16 blend_pixel(cv1k_u16 src, cv1k_u16 dst, cv1k_
     return (cv1k_u16)((src & 0x8000U) | (cv1k_u16)((cv1k_u16)out.r << 10) | (cv1k_u16)((cv1k_u16)out.g << 5) | (cv1k_u16)out.b);
 }
 
+
+
+static CV1K_ALWAYS_INLINE int cv1k_ranges_disjoint_u16(const cv1k_u16 *a, const cv1k_u16 *b, cv1k_u32 count)
+{
+    uintptr_t ap = (uintptr_t)(const void *)a;
+    uintptr_t bp = (uintptr_t)(const void *)b;
+    uintptr_t bytes = (uintptr_t)count * (uintptr_t)sizeof(cv1k_u16);
+    return (ap + bytes <= bp) || (bp + bytes <= ap);
+}
+
+static CV1K_ALWAYS_INLINE void copy_alpha_test_row_fast(cv1k_u16 *dst, const cv1k_u16 *src, cv1k_u32 count, int disjoint)
+{
+    cv1k_u32 i = 0UL;
+#if defined(__AVX2__)
+    if (disjoint && count >= 16UL) {
+        __m256i zero = _mm256_setzero_si256();
+        for (; i + 16UL <= count; i += 16UL) {
+            __m256i s = _mm256_loadu_si256((const __m256i *)(const void *)(src + i));
+            int mb = _mm256_movemask_epi8(s) & 0xaaaaaaaa;
+            if (mb == 0) continue;
+            if (mb == (int)0xaaaaaaaaU) {
+                _mm256_storeu_si256((__m256i *)(void *)(dst + i), s);
+            } else {
+                __m256i d = _mm256_loadu_si256((const __m256i *)(const void *)(dst + i));
+                __m256i mask = _mm256_cmpgt_epi16(zero, s);
+                __m256i out = _mm256_or_si256(_mm256_and_si256(mask, s), _mm256_andnot_si256(mask, d));
+                _mm256_storeu_si256((__m256i *)(void *)(dst + i), out);
+            }
+        }
+    }
+#elif defined(__SSE2__)
+    if (disjoint && count >= 8UL) {
+        __m128i zero = _mm_setzero_si128();
+        for (; i + 8UL <= count; i += 8UL) {
+            __m128i s = _mm_loadu_si128((const __m128i *)(const void *)(src + i));
+            int mb = _mm_movemask_epi8(s) & 0xaaaa;
+            if (mb == 0) continue;
+            if (mb == 0xaaaa) {
+                _mm_storeu_si128((__m128i *)(void *)(dst + i), s);
+            } else {
+                __m128i d = _mm_loadu_si128((const __m128i *)(const void *)(dst + i));
+                __m128i mask = _mm_cmpgt_epi16(zero, s);
+                __m128i out = _mm_or_si128(_mm_and_si128(mask, s), _mm_andnot_si128(mask, d));
+                _mm_storeu_si128((__m128i *)(void *)(dst + i), out);
+            }
+        }
+    }
+#else
+    CV1K_UNUSED(disjoint);
+#endif
+    for (; i < count; i++) {
+        cv1k_u16 v = src[i];
+        if ((v & 0x8000U) != 0U) dst[i] = v;
+    }
+}
+
+static CV1K_ALWAYS_INLINE int src_alpha_mask8_none(const cv1k_u16 *src)
+{
+#if defined(__SSE2__)
+    __m128i s = _mm_loadu_si128((const __m128i *)(const void *)src);
+    return ((_mm_movemask_epi8(s) & 0xaaaa) == 0);
+#else
+    return ((src[0] | src[1] | src[2] | src[3] | src[4] | src[5] | src[6] | src[7]) & 0x8000U) == 0U;
+#endif
+}
+
+
+#if defined(__AVX2__)
+static CV1K_ALWAYS_INLINE __m256i blend_s0d7_sa31_vec(__m256i s, __m256i d)
+{
+    const __m256i mask_a = _mm256_set1_epi16((short)0x8000);
+    const __m256i mask_r = _mm256_set1_epi16((short)0x7c00);
+    const __m256i mask_g = _mm256_set1_epi16((short)0x03e0);
+    const __m256i mask_b = _mm256_set1_epi16((short)0x001f);
+    const __m256i max31 = _mm256_set1_epi16(31);
+    __m256i sr = _mm256_srli_epi16(_mm256_and_si256(s, mask_r), 10);
+    __m256i sg = _mm256_srli_epi16(_mm256_and_si256(s, mask_g), 5);
+    __m256i sb = _mm256_and_si256(s, mask_b);
+    __m256i dr = _mm256_srli_epi16(_mm256_and_si256(d, mask_r), 10);
+    __m256i dg = _mm256_srli_epi16(_mm256_and_si256(d, mask_g), 5);
+    __m256i db = _mm256_and_si256(d, mask_b);
+    __m256i rr = _mm256_min_epu16(_mm256_add_epi16(sr, dr), max31);
+    __m256i gg = _mm256_min_epu16(_mm256_add_epi16(sg, dg), max31);
+    __m256i bb = _mm256_min_epu16(_mm256_add_epi16(sb, db), max31);
+    return _mm256_or_si256(_mm256_and_si256(s, mask_a),
+        _mm256_or_si256(_mm256_slli_epi16(rr, 10),
+        _mm256_or_si256(_mm256_slli_epi16(gg, 5), bb)));
+}
+#endif
+
+static CV1K_ALWAYS_INLINE void blend_s0d7_row_fast(cv1k_u16 *dst, const cv1k_u16 *src, cv1k_u32 count, cv1k_u8 src_alpha, int alpha_test)
+{
+    cv1k_u32 i;
+#if defined(__AVX2__)
+    if (src_alpha == 0x1fU && count >= 16UL) {
+        const __m256i zero = _mm256_setzero_si256();
+        for (i = 0UL; i + 16UL <= count; i += 16UL) {
+            __m256i s = _mm256_loadu_si256((const __m256i *)(const void *)(src + i));
+            __m256i d = _mm256_loadu_si256((const __m256i *)(const void *)(dst + i));
+            __m256i out = blend_s0d7_sa31_vec(s, d);
+            if (alpha_test) {
+                __m256i mask = _mm256_cmpgt_epi16(zero, s);
+                out = _mm256_or_si256(_mm256_and_si256(mask, out), _mm256_andnot_si256(mask, d));
+            }
+            _mm256_storeu_si256((__m256i *)(void *)(dst + i), out);
+        }
+        for (; i < count; i++) {
+            cv1k_u16 s = src[i];
+            if (!alpha_test || (s & 0x8000U) != 0U) dst[i] = blend_s0d7_sa31_pixel(s, dst[i]);
+        }
+        return;
+    }
+#endif
+    if (alpha_test) {
+        if (src_alpha == 0x1fU) {
+            for (i = 0UL; i < count; i++) { cv1k_u16 s = src[i]; if ((s & 0x8000U) != 0U) dst[i] = blend_s0d7_sa31_pixel(s, dst[i]); }
+        } else {
+            for (i = 0UL; i < count; i++) { cv1k_u16 s = src[i]; if ((s & 0x8000U) != 0U) dst[i] = blend_s0d7_pixel(s, dst[i], src_alpha); }
+        }
+    } else {
+        if (src_alpha == 0x1fU) {
+            for (i = 0UL; i < count; i++) { cv1k_u16 s = src[i]; dst[i] = blend_s0d7_sa31_pixel(s, dst[i]); }
+        } else {
+            for (i = 0UL; i < count; i++) { cv1k_u16 s = src[i]; dst[i] = blend_s0d7_pixel(s, dst[i], src_alpha); }
+        }
+    }
+}
+
+static CV1K_ALWAYS_INLINE void blend_s0d4_row_fast(cv1k_u16 *dst, const cv1k_u16 *src, cv1k_u32 count, const cv1k_u8 *lut, int alpha_test)
+{
+    cv1k_u32 i;
+    if (alpha_test) {
+        for (i = 0UL; i < count; i++) { cv1k_u16 s = src[i]; if ((s & 0x8000U) != 0U) dst[i] = blend_s0d4_lut_pixel(s, dst[i], lut); }
+    } else {
+        for (i = 0UL; i < count; i++) { cv1k_u16 s = src[i]; dst[i] = blend_s0d4_lut_pixel(s, dst[i], lut); }
+    }
+}
+
+static CV1K_ALWAYS_INLINE cv1k_u16 blend_s0d0_pixel_fast(cv1k_u16 src, cv1k_u16 dst, cv1k_u8 src_alpha, cv1k_u8 dst_alpha)
+{
+    cv1k_u32 sr = (src >> 10) & 0x1fU;
+    cv1k_u32 sg = (src >> 5) & 0x1fU;
+    cv1k_u32 sb = src & 0x1fU;
+    cv1k_u32 dr = (dst >> 10) & 0x1fU;
+    cv1k_u32 dg = (dst >> 5) & 0x1fU;
+    cv1k_u32 db = dst & 0x1fU;
+    return (cv1k_u16)((src & 0x8000U) |
+        ((cv1k_u16)CV1K_ADD5(CV1K_MUL5(src_alpha, sr), CV1K_MUL5(dst_alpha, dr)) << 10) |
+        ((cv1k_u16)CV1K_ADD5(CV1K_MUL5(src_alpha, sg), CV1K_MUL5(dst_alpha, dg)) << 5) |
+        (cv1k_u16)CV1K_ADD5(CV1K_MUL5(src_alpha, sb), CV1K_MUL5(dst_alpha, db)));
+}
+
+static CV1K_ALWAYS_INLINE void blend_s0d0_row_fast(cv1k_u16 *dst, const cv1k_u16 *src, cv1k_u32 count, cv1k_u8 src_alpha, cv1k_u8 dst_alpha, int alpha_test)
+{
+    cv1k_u32 i;
+    if (alpha_test) {
+        for (i = 0UL; i < count; i++) { cv1k_u16 s = src[i]; if ((s & 0x8000U) != 0U) dst[i] = blend_s0d0_pixel_fast(s, dst[i], src_alpha, dst_alpha); }
+    } else {
+        for (i = 0UL; i < count; i++) { cv1k_u16 s = src[i]; dst[i] = blend_s0d0_pixel_fast(s, dst[i], src_alpha, dst_alpha); }
+    }
+}
+
+static CV1K_ALWAYS_INLINE void blend_s0d1_row_fast(cv1k_u16 *dst, const cv1k_u16 *src, cv1k_u32 count, cv1k_u8 src_alpha, int alpha_test)
+{
+    cv1k_u32 i;
+    if (alpha_test) {
+        if (src_alpha == 0U) {
+            for (i = 0UL; i < count; i++) { cv1k_u16 s = src[i]; if ((s & 0x8000U) != 0U) dst[i] = blend_s0d1_sa0_pixel(s, dst[i]); }
+        } else {
+            for (i = 0UL; i < count; i++) { cv1k_u16 s = src[i]; if ((s & 0x8000U) != 0U) dst[i] = blend_pixel(s, dst[i], src_alpha, 0U, 0, 1); }
+        }
+    } else {
+        if (src_alpha == 0U) {
+            for (i = 0UL; i < count; i++) { cv1k_u16 s = src[i]; dst[i] = blend_s0d1_sa0_pixel(s, dst[i]); }
+        } else {
+            for (i = 0UL; i < count; i++) { cv1k_u16 s = src[i]; dst[i] = blend_pixel(s, dst[i], src_alpha, 0U, 0, 1); }
+        }
+    }
+}
+
 static cv1k_u16 read_ram16(const cv1k_u8 *ram, cv1k_u32 ram_size, cv1k_u32 addr)
 {
     if (ram == NULL || ram_size < 2UL) return 0xffffU;
@@ -297,6 +626,15 @@ static cv1k_s32 sign16(cv1k_u16 v)
     x = (cv1k_u32)v;
     if ((x & 0x8000UL) != 0UL) x |= 0xffff0000UL;
     return (cv1k_s32)x;
+}
+
+static CV1K_ALWAYS_INLINE cv1k_u32 count_nonzero1555(const cv1k_u16 *p, cv1k_u32 count)
+{
+    cv1k_u32 i;
+    cv1k_u32 n;
+    n = 0UL;
+    for (i = 0UL; i < count; i++) n += ((p[i] & 0x7fffU) != 0U);
+    return n;
 }
 
 cv1k_u32 cv1k_video_vram_bytes(void)
@@ -325,6 +663,7 @@ void cv1k_video_mark_vram_dirty_all(struct cv1k_video *video)
     cv1k_u32 i;
     cv1k_u32 gen;
     if (video == NULL) return;
+    if (!video->vram_dirty_tracking) return;
     gen = video->vram_dirty_generation + 1UL;
     if (gen == 0UL) {
         gen = 1UL;
@@ -345,6 +684,7 @@ void cv1k_video_mark_vram_dirty_rect(struct cv1k_video *video, cv1k_u32 x, cv1k_
     cv1k_u32 ty;
     cv1k_u32 gen;
     if (video == NULL || w == 0UL || h == 0UL || x >= CV1K_VRAM_W || y >= CV1K_VRAM_H) return;
+    if (!video->vram_dirty_tracking) return;
     if (w > CV1K_VRAM_W - x) w = CV1K_VRAM_W - x;
     if (h > CV1K_VRAM_H - y) h = CV1K_VRAM_H - y;
     gen = video->vram_dirty_generation + 1UL;
@@ -386,6 +726,7 @@ void cv1k_video_shutdown(struct cv1k_video *video)
 {
     cv1k_free(video->vram1555);
     cv1k_free(video->screen_rgb);
+    cv1k_free(video->blit_shadow);
     memset(video, 0, sizeof(*video));
 }
 
@@ -447,6 +788,7 @@ void cv1k_video_reset(struct cv1k_video *video)
     video->fpga_firmware_version = -1L;
     video->fpga_firmware_port = 0U;
     video->fpga_firmware_byte = 0U;
+    video->vram_dirty_tracking = 0;
     video->vram_dirty_generation = 0UL;
     memset(video->vram_tile_generation, 0, sizeof(video->vram_tile_generation));
     cv1k_video_mark_vram_dirty_all(video);
@@ -617,6 +959,103 @@ static void finish_blit_delay_mame(struct cv1k_video *video)
     if (video->busy_cycles_ns > CV1K_FRAME_DURATION_NANOSEC) video->blit_over_frame_count++;
 }
 
+
+static CV1K_ALWAYS_INLINE cv1k_u32 upload_be16_row_fast(cv1k_u16 *dst, const cv1k_u8 *src, cv1k_u32 count)
+{
+    cv1k_u32 i = 0UL;
+    cv1k_u32 nonzero = 0UL;
+#if defined(__AVX2__)
+    const __m256i shuf = _mm256_setr_epi8(
+        1,0, 3,2, 5,4, 7,6, 9,8, 11,10, 13,12, 15,14,
+        1,0, 3,2, 5,4, 7,6, 9,8, 11,10, 13,12, 15,14);
+    const __m256i m7fff = _mm256_set1_epi16((short)0x7fff);
+    const __m256i z = _mm256_setzero_si256();
+    for (; i + 15UL < count; i += 16UL) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)src);
+        __m256i w = _mm256_shuffle_epi8(v, shuf);
+        __m256i nz = _mm256_and_si256(w, m7fff);
+        __m256i eq = _mm256_cmpeq_epi16(nz, z);
+        _mm256_storeu_si256((__m256i *)(void *)dst, w);
+        nonzero += 16UL - (cv1k_u32)(__builtin_popcount((unsigned)_mm256_movemask_epi8(eq)) >> 1);
+        src += 32;
+        dst += 16;
+    }
+#elif defined(__SSSE3__)
+    const __m128i shuf = _mm_setr_epi8(1,0, 3,2, 5,4, 7,6, 9,8, 11,10, 13,12, 15,14);
+    const __m128i m7fff = _mm_set1_epi16((short)0x7fff);
+    const __m128i z = _mm_setzero_si128();
+    for (; i + 7UL < count; i += 8UL) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(const void *)src);
+        __m128i w = _mm_shuffle_epi8(v, shuf);
+        __m128i nz = _mm_and_si128(w, m7fff);
+        __m128i eq = _mm_cmpeq_epi16(nz, z);
+        _mm_storeu_si128((__m128i *)(void *)dst, w);
+        nonzero += 8UL - (cv1k_u32)(__builtin_popcount((unsigned)_mm_movemask_epi8(eq)) >> 1);
+        src += 16;
+        dst += 8;
+    }
+#endif
+    for (; i + 3UL < count; i += 4UL) {
+        cv1k_u16 p0 = (cv1k_u16)(((cv1k_u16)src[0] << 8) | src[1]);
+        cv1k_u16 p1 = (cv1k_u16)(((cv1k_u16)src[2] << 8) | src[3]);
+        cv1k_u16 p2 = (cv1k_u16)(((cv1k_u16)src[4] << 8) | src[5]);
+        cv1k_u16 p3 = (cv1k_u16)(((cv1k_u16)src[6] << 8) | src[7]);
+        dst[0] = p0; dst[1] = p1; dst[2] = p2; dst[3] = p3;
+        nonzero += ((p0 & 0x7fffU) != 0U);
+        nonzero += ((p1 & 0x7fffU) != 0U);
+        nonzero += ((p2 & 0x7fffU) != 0U);
+        nonzero += ((p3 & 0x7fffU) != 0U);
+        src += 8;
+        dst += 4;
+    }
+    for (; i < count; i++) {
+        cv1k_u16 px = (cv1k_u16)(((cv1k_u16)src[0] << 8) | src[1]);
+        *dst++ = px;
+        nonzero += ((px & 0x7fffU) != 0U);
+        src += 2;
+    }
+    return nonzero;
+}
+
+static CV1K_ALWAYS_INLINE void upload_be16_row_copy_fast(cv1k_u16 *dst, const cv1k_u8 *src, cv1k_u32 count)
+{
+    cv1k_u32 i = 0UL;
+#if defined(__AVX2__)
+    const __m256i shuf = _mm256_setr_epi8(
+        1,0, 3,2, 5,4, 7,6, 9,8, 11,10, 13,12, 15,14,
+        1,0, 3,2, 5,4, 7,6, 9,8, 11,10, 13,12, 15,14);
+    for (; i + 15UL < count; i += 16UL) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)src);
+        __m256i w = _mm256_shuffle_epi8(v, shuf);
+        _mm256_storeu_si256((__m256i *)(void *)dst, w);
+        src += 32;
+        dst += 16;
+    }
+#elif defined(__SSSE3__)
+    const __m128i shuf = _mm_setr_epi8(1,0, 3,2, 5,4, 7,6, 9,8, 11,10, 13,12, 15,14);
+    for (; i + 7UL < count; i += 8UL) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(const void *)src);
+        __m128i w = _mm_shuffle_epi8(v, shuf);
+        _mm_storeu_si128((__m128i *)(void *)dst, w);
+        src += 16;
+        dst += 8;
+    }
+#endif
+    for (; i + 3UL < count; i += 4UL) {
+        dst[0] = (cv1k_u16)(((cv1k_u16)src[0] << 8) | src[1]);
+        dst[1] = (cv1k_u16)(((cv1k_u16)src[2] << 8) | src[3]);
+        dst[2] = (cv1k_u16)(((cv1k_u16)src[4] << 8) | src[5]);
+        dst[3] = (cv1k_u16)(((cv1k_u16)src[6] << 8) | src[7]);
+        src += 8;
+        dst += 4;
+    }
+    for (; i < count; i++) {
+        *dst++ = (cv1k_u16)(((cv1k_u16)src[0] << 8) | src[1]);
+        src += 2;
+    }
+}
+
+
 static CV1K_HOT cv1k_u32 execute_upload(struct cv1k_video *video, cv1k_u32 addr, const cv1k_u8 *ram, cv1k_u32 ram_size)
 {
     cv1k_u32 dst_x;
@@ -640,26 +1079,51 @@ static CV1K_HOT cv1k_u32 execute_upload(struct cv1k_video *video, cv1k_u32 addr,
     video->last_upload_w = w;
     video->last_upload_h = h;
     video->last_upload_pixels = w * h;
-    for (py = 0UL; py < h; py++) {
-        for (px = 0UL; px < w; px++) {
-            pen = read_ram16(ram, ram_size, pos);
-            pos += 2UL;
-            if ((pen & 0x7fffU) != 0U) nonzero++;
-            /* MAME's gfx_upload() masks the starting co-ordinates but then
-             * writes through a linear bitmap row pointer.  It does not
-             * wrap each uploaded pixel through the source/draw VRAM indexer.
-             * The sandbox's earlier per-pixel vram_index() wrap could smear
-             * over-edge upload data into the top-left atlas/title pages and
-             * amplify stale list replays into visible corruption.
-             */
-            if (video->vram1555 != NULL && dst_y + py < CV1K_VRAM_H) {
-                cv1k_u32 dst_index;
-                dst_index = (dst_y + py) * CV1K_VRAM_W + dst_x + px;
-                if (dst_index < CV1K_VRAM_W * CV1K_VRAM_H) video->vram1555[dst_index] = pen;
+
+    /* Hot path for the common MAME snapshot case: the upload payload is a
+     * contiguous big-endian 1555 stream and the destination rectangle is fully
+     * inside the linear VRAM bitmap.  Avoid read_ram16()'s modulo/bounds work
+     * per pixel and write/count each row directly. */
+    if (CV1K_LIKELY(video->vram1555 != NULL && ram != NULL &&
+                    pos <= ram_size && h != 0UL && w != 0UL &&
+                    (uint64_t)pos + (uint64_t)w * (uint64_t)h * 2ULL <= (uint64_t)ram_size &&
+                    dst_y < CV1K_VRAM_H && h <= CV1K_VRAM_H - dst_y &&
+                    dst_x < CV1K_VRAM_W && w <= CV1K_VRAM_W - dst_x)) {
+        const cv1k_u8 *src = ram + pos;
+        for (py = 0UL; py < h; py++) {
+            cv1k_u16 *dst = video->vram1555 + (dst_y + py) * CV1K_VRAM_W + dst_x;
+#if CV1K_VIDEO_DIAG_UPLOAD_COUNTS
+            nonzero += upload_be16_row_fast(dst, src, w);
+#else
+            upload_be16_row_copy_fast(dst, src, w);
+#endif
+            src += w * 2UL;
+        }
+        pos += w * h * 2UL;
+    } else {
+        for (py = 0UL; py < h; py++) {
+            for (px = 0UL; px < w; px++) {
+                pen = read_ram16(ram, ram_size, pos);
+                pos += 2UL;
+#if CV1K_VIDEO_DIAG_UPLOAD_COUNTS
+                if ((pen & 0x7fffU) != 0U) nonzero++;
+#endif
+                /* MAME's gfx_upload() masks the starting co-ordinates but then
+                 * writes through a linear bitmap row pointer.  It does not
+                 * wrap each uploaded pixel through the source/draw VRAM indexer.
+                 * The sandbox's earlier per-pixel vram_index() wrap could smear
+                 * over-edge upload data into the top-left atlas/title pages and
+                 * amplify stale list replays into visible corruption.
+                 */
+                if (video->vram1555 != NULL && dst_y + py < CV1K_VRAM_H) {
+                    cv1k_u32 dst_index;
+                    dst_index = (dst_y + py) * CV1K_VRAM_W + dst_x + px;
+                    if (dst_index < CV1K_VRAM_W * CV1K_VRAM_H) video->vram1555[dst_index] = pen;
+                }
             }
         }
     }
-    if (w != 0UL && h != 0UL) cv1k_video_mark_vram_dirty_rect(video, dst_x, dst_y, w, h);
+    if (video->vram_dirty_tracking && w != 0UL && h != 0UL) cv1k_video_mark_vram_dirty_rect(video, dst_x, dst_y, w, h);
     if (video->gpu_ops != NULL && video->gpu_ops->upload != NULL && w != 0UL && h != 0UL) {
         struct cv1k_video_gpu_upload_cmd gpu_cmd;
         int gpu_ok;
@@ -673,8 +1137,13 @@ static CV1K_HOT cv1k_u32 execute_upload(struct cv1k_video *video, cv1k_u32 addr,
         if (gpu_ok) video->gpu_executed_ops++;
         else video->gpu_fallback_ops++;
     }
+#if CV1K_VIDEO_DIAG_UPLOAD_COUNTS
     video->last_upload_nonzero = nonzero;
     video->upload_nonzero_total += nonzero;
+#else
+    CV1K_UNUSED(nonzero);
+    video->last_upload_nonzero = 0UL;
+#endif
     video->upload_ops++;
     video->busy_cycles_ns += (((CV1K_UPLOAD_HEADER_SIZE_BYTES + w * h * 2UL) / 4UL) * CV1K_SRAM_CLK_NANOSEC);
     video->blit_idle_op_bytes = 0UL;
@@ -725,6 +1194,10 @@ static CV1K_HOT cv1k_u32 execute_draw(struct cv1k_video *video, cv1k_u32 addr, c
     cv1k_u32 px1;
     cv1k_u32 py0;
     cv1k_u32 py1;
+    const cv1k_u8 *blend04_lut;
+    int flipx_fast;
+    int flipy_fast;
+    int src_y_linear_ok;
     flags = read_ram16(ram, ram_size, addr + 0UL);
     alphaw = read_ram16(ram, ram_size, addr + 2UL);
     src_x = (cv1k_u32)(read_ram16(ram, ram_size, addr + 4UL) & 0x1fffU);
@@ -742,6 +1215,7 @@ static CV1K_HOT cv1k_u32 execute_draw(struct cv1k_video *video, cv1k_u32 addr, c
     dst_mode = (cv1k_u8)(flags & 7U);
     blend_enabled = ((flags & 0x0200U) != 0U) ? 1 : 0;
     if (src_mode == 0U && src_alpha == 0x1fU && dst_mode == 4U && dst_alpha == 0x1fU) blend_enabled = 0;
+    blend04_lut = (blend_enabled && src_mode == 0U && dst_mode == 4U) ? cv1k_get_blend_s0d4_lut(src_alpha, dst_alpha) : NULL;
     tint_enabled = (((mul_r >> 2) != 0x20U) || ((mul_g >> 2) != 0x20U) || ((mul_b >> 2) != 0x20U)) ? 1 : 0;
     if (w > CV1K_VRAM_W) w = CV1K_VRAM_W;
     if (h > CV1K_VRAM_H) h = CV1K_VRAM_H;
@@ -791,26 +1265,86 @@ static CV1K_HOT cv1k_u32 execute_draw(struct cv1k_video *video, cv1k_u32 addr, c
         px1 = (cv1k_u32)(vis_r - dst_x);
         py0 = (cv1k_u32)(vis_t - dst_y);
         py1 = (cv1k_u32)(vis_b - dst_y);
+#if CV1K_VIDEO_DRAW_HIST
+        cv1k_draw_hist_init();
+        if (getenv("CV1K_DRAW_HIST") != NULL) {
+#if CV1K_VIDEO_DRAW_HIST == 1
+            cv1k_draw_hist_ops[flags]++;
+            cv1k_draw_hist_px[flags] += (unsigned long long)(px1 - px0) * (unsigned long long)(py1 - py0);
+#else
+            cv1k_draw_hist_add(((cv1k_u32)flags << 16) | (cv1k_u32)alphaw, (unsigned long long)(px1 - px0) * (unsigned long long)(py1 - py0));
+#endif
+        }
+#endif
+        flipx_fast = ((flags & 0x0800U) != 0U);
+        flipy_fast = ((flags & 0x0400U) != 0U);
+        src_y_linear_ok = flipy_fast ? ((src_y + h) <= CV1K_VRAM_H) : ((src_y + py1) <= CV1K_VRAM_H);
 
         /* The overwhelmingly common CV1000 path during gameplay/UI upload is
          * an untinted, unblended, alpha-tested atlas copy.  Pre-clip it once
          * and walk linear rows; this preserves the old forward-copy semantics
          * while removing four bounds/clip branches and two vram_index() calls
          * from every visible pixel. */
-        if (CV1K_LIKELY(!blend_enabled && !tint_enabled && (flags & 0x0c00U) == 0U &&
-            src_x + px1 <= CV1K_VRAM_W && src_y + py1 <= CV1K_VRAM_H)) {
+        if (CV1K_LIKELY(!blend_enabled && !tint_enabled && !flipx_fast && src_y_linear_ok &&
+            src_x + px1 <= CV1K_VRAM_W)) {
             cv1k_u32 count = px1 - px0;
             int alpha_test = ((flags & 0x0100U) != 0U);
             for (py = py0; py < py1; py++) {
-                const cv1k_u16 *sp = video->vram1555 + (src_y + py) * CV1K_VRAM_W + src_x + px0;
+                cv1k_u32 sy_fast = flipy_fast ? (src_y + (h - 1UL - py)) : (src_y + py);
+                const cv1k_u16 *sp = video->vram1555 + sy_fast * CV1K_VRAM_W + src_x + px0;
                 cv1k_u16 *dp = video->vram1555 + ((cv1k_u32)(dst_y + (cv1k_s32)py)) * CV1K_VRAM_W + (cv1k_u32)(dst_x + (cv1k_s32)px0);
-                for (px = 0UL; px < count; px++) {
-                    src = sp[px];
-                    if ((src & 0x7fffU) != 0U) src_nonzero++;
-                    if (alpha_test && (src & 0x8000U) == 0U) continue;
-                    dp[px] = src;
-                    written++;
-                    if ((src & 0x7fffU) != 0U) written_nonzero++;
+                if (!alpha_test && (dp + count <= sp || sp + count <= dp)) {
+#if CV1K_VIDEO_DIAG_DRAW_COUNTS
+                    cv1k_u32 nz;
+                    nz = count_nonzero1555(sp, count);
+#endif
+                    memcpy(dp, sp, (size_t)count * sizeof(cv1k_u16));
+#if CV1K_VIDEO_DIAG_DRAW_COUNTS
+                    src_nonzero += nz;
+                    written += count;
+                    written_nonzero += nz;
+#endif
+                } else if (alpha_test) {
+#if CV1K_VIDEO_DIAG_DRAW_COUNTS
+                    for (px = 0UL; px < count; px++) {
+                        src = sp[px];
+                        if ((src & 0x7fffU) != 0U) src_nonzero++;
+                        if ((src & 0x8000U) == 0U) continue;
+                        dp[px] = src;
+                        written++;
+                        if ((src & 0x7fffU) != 0U) written_nonzero++;
+                    }
+#else
+                    copy_alpha_test_row_fast(dp, sp, count, cv1k_ranges_disjoint_u16(dp, sp, count));
+#endif
+                } else {
+                    for (px = 0UL; px < count; px++) {
+                        src = sp[px];
+#if CV1K_VIDEO_DIAG_DRAW_COUNTS
+                        if ((src & 0x7fffU) != 0U) src_nonzero++;
+#endif
+                        dp[px] = src;
+#if CV1K_VIDEO_DIAG_DRAW_COUNTS
+                        written++;
+                        if ((src & 0x7fffU) != 0U) written_nonzero++;
+#endif
+                    }
+                }
+            }
+        } else if (CV1K_LIKELY(!tint_enabled && blend_enabled && !flipx_fast && src_y_linear_ok &&
+                   src_mode == 0U && src_x + px1 <= CV1K_VRAM_W &&
+                   (dst_mode == 0U || dst_mode == 1U || dst_mode == 4U || dst_mode == 7U))) {
+            cv1k_u32 count = px1 - px0;
+            int alpha_test = ((flags & 0x0100U) != 0U);
+            for (py = py0; py < py1; py++) {
+                cv1k_u32 sy_fast = flipy_fast ? (src_y + (h - 1UL - py)) : (src_y + py);
+                const cv1k_u16 *sp = video->vram1555 + sy_fast * CV1K_VRAM_W + src_x + px0;
+                cv1k_u16 *dp = video->vram1555 + ((cv1k_u32)(dst_y + (cv1k_s32)py)) * CV1K_VRAM_W + (cv1k_u32)(dst_x + (cv1k_s32)px0);
+                switch (dst_mode) {
+                case 0U: blend_s0d0_row_fast(dp, sp, count, src_alpha, dst_alpha, alpha_test); break;
+                case 1U: blend_s0d1_row_fast(dp, sp, count, src_alpha, alpha_test); break;
+                case 4U: blend_s0d4_row_fast(dp, sp, count, blend04_lut, alpha_test); break;
+                default: blend_s0d7_row_fast(dp, sp, count, src_alpha, alpha_test); break;
                 }
             }
         } else {
@@ -830,24 +1364,38 @@ static CV1K_HOT cv1k_u32 execute_draw(struct cv1k_video *video, cv1k_u32 addr, c
                 for (px = px0; px < px1; px++, sx_cur = (cv1k_u32)((cv1k_s32)sx_cur + sstep)) {
                     cv1k_u32 dx_cur = (cv1k_u32)(dst_x + (cv1k_s32)px);
                     src = srow[sx_cur & (CV1K_VRAM_W - 1UL)];
+#if CV1K_VIDEO_DIAG_DRAW_COUNTS
                     if ((src & 0x7fffU) != 0U) src_nonzero++;
+#endif
                     if (alpha_test && (src & 0x8000U) == 0U) continue;
                     if (tint_enabled) src = apply_tint(src, mul_r, mul_g, mul_b);
                     if (blend_enabled) {
                         cv1k_u32 di = drow + dx_cur;
                         dst = video->vram1555[di];
-                        src = blend_pixel(src, dst, src_alpha, dst_alpha, (int)src_mode, (int)dst_mode);
+                        if (src_mode == 0U && dst_mode == 1U && src_alpha == 0U) src = blend_s0d1_sa0_pixel(src, dst);
+                        else if (blend04_lut != NULL) src = blend_s0d4_lut_pixel(src, dst, blend04_lut);
+                        else if (src_mode == 0U && dst_mode == 7U && src_alpha == 0x1fU) src = blend_s0d7_sa31_pixel(src, dst);
+                        else if (src_mode == 0U && dst_mode == 7U) src = blend_s0d7_pixel(src, dst, src_alpha);
+                        else src = blend_pixel(src, dst, src_alpha, dst_alpha, (int)src_mode, (int)dst_mode);
                         video->vram1555[di] = src;
                     } else {
                         video->vram1555[drow + dx_cur] = src;
                     }
+#if CV1K_VIDEO_DIAG_DRAW_COUNTS
                     written++;
                     if ((src & 0x7fffU) != 0U) written_nonzero++;
+#endif
                 }
             }
         }
     }
-    if (written != 0UL) {
+#if !CV1K_VIDEO_DIAG_DRAW_COUNTS
+    if (vis_l < vis_r && vis_t < vis_b && video->vram1555 != NULL) {
+        uint64_t visible_pixels = (uint64_t)(cv1k_u32)(vis_r - vis_l) * (uint64_t)(cv1k_u32)(vis_b - vis_t);
+        written = (visible_pixels > 0xffffffffULL) ? 0xffffffffUL : (cv1k_u32)visible_pixels;
+    }
+#endif
+    if (video->vram_dirty_tracking && written != 0UL) {
         cv1k_video_mark_vram_dirty_rect(video, (cv1k_u32)vis_l, (cv1k_u32)vis_t, (cv1k_u32)(vis_r - vis_l), (cv1k_u32)(vis_b - vis_t));
     }
     if (video->gpu_ops != NULL && video->gpu_ops->draw != NULL && written != 0UL) {
@@ -878,12 +1426,20 @@ static CV1K_HOT cv1k_u32 execute_draw(struct cv1k_video *video, cv1k_u32 addr, c
         if (gpu_ok) video->gpu_executed_ops++;
         else video->gpu_fallback_ops++;
     }
+#if CV1K_VIDEO_DIAG_DRAW_COUNTS
     video->last_draw_src_nonzero = src_nonzero;
     video->last_draw_written = written;
     video->last_draw_written_nonzero = written_nonzero;
     video->draw_src_nonzero_total += src_nonzero;
     video->draw_written_total += written;
     video->draw_written_nonzero_total += written_nonzero;
+#else
+    CV1K_UNUSED(src_nonzero);
+    CV1K_UNUSED(written_nonzero);
+    video->last_draw_src_nonzero = 0UL;
+    video->last_draw_written = 0UL;
+    video->last_draw_written_nonzero = 0UL;
+#endif
     /* MAME estimates draw time from clipped source/destination VRAM row
      * accesses and 4-pixel DDR transfers.  The pixel loop above is still the
      * sandbox renderer, but the timing/accounting path now follows
@@ -1081,26 +1637,39 @@ static void cv1k_video_execute_list_common(struct cv1k_video *video, cv1k_u32 ad
 {
     cv1k_u8 *shadow;
     cv1k_u32 local_addr;
+    cv1k_u32 shadow_end;
     cv1k_u32 shadow_size;
     /* MAME snapshots the blit command stream before queuing the worker.
      * Earlier sandbox builds copied the full 8/16 MiB work RAM for every
-     * execute pulse.  DDPSDOJ command/upload lists are linear, so first scan
-     * the list bounds and snapshot only the prefix containing the stream; this
-     * preserves self-modifying-list isolation without gigabytes of avoidable
-     * memcpy traffic during boot and attract-mode blits. */
+     * execute pulse.  The first optimization copied only the prefix ending at
+     * the command stream, but lists often live far into work RAM; that still
+     * copies megabytes to execute a few dozen bytes of commands.  CV1000 blit
+     * command lists are linear streams, so snapshot the exact byte range and
+     * execute it from offset zero. */
     if (ram == NULL || ram_size < 2UL) return;
     video->last_list_addr = addr;
     local_addr = addr % ram_size;
-    shadow_size = 0UL;
-    if (end_addr > local_addr && end_addr <= ram_size) shadow_size = end_addr;
-    else shadow_size = cv1k_video_measure_list_end(local_addr, ram, ram_size, max_ops);
-    if (shadow_size <= local_addr || shadow_size > ram_size) shadow_size = ram_size;
+    shadow_end = 0UL;
+    if (end_addr > local_addr && end_addr <= ram_size) shadow_end = end_addr;
+    else shadow_end = cv1k_video_measure_list_end(local_addr, ram, ram_size, max_ops);
+    shadow_size = (shadow_end > local_addr && shadow_end <= ram_size) ? (shadow_end - local_addr) : 0UL;
 
-    shadow = (cv1k_u8 *)cv1k_xmalloc(shadow_size);
+    shadow = NULL;
+    if (shadow_size != 0UL) {
+        if (shadow_size > video->blit_shadow_capacity) {
+            cv1k_u8 *new_shadow;
+            new_shadow = (cv1k_u8 *)cv1k_xmalloc(shadow_size);
+            if (new_shadow != NULL) {
+                cv1k_free(video->blit_shadow);
+                video->blit_shadow = new_shadow;
+                video->blit_shadow_capacity = shadow_size;
+            }
+        }
+        if (shadow_size <= video->blit_shadow_capacity) shadow = video->blit_shadow;
+    }
     if (shadow != NULL) {
-        memcpy(shadow, ram, (size_t)shadow_size);
-        cv1k_video_execute_list_from(video, local_addr, shadow_size, shadow, shadow_size, max_ops);
-        cv1k_free(shadow);
+        memcpy(shadow, ram + local_addr, (size_t)shadow_size);
+        cv1k_video_execute_list_from(video, 0UL, shadow_size, shadow, shadow_size, max_ops);
     } else {
         cv1k_video_execute_list_from(video, addr, end_addr, ram, ram_size, max_ops);
     }
@@ -1185,6 +1754,7 @@ CV1K_HOT void cv1k_video_write32(struct cv1k_video *video, cv1k_u32 offset, cv1k
     }
 }
 
+
 CV1K_HOT void cv1k_video_frame(struct cv1k_video *video, const cv1k_u8 *ram, cv1k_u32 ram_size)
 {
     cv1k_u32 x;
@@ -1225,19 +1795,28 @@ CV1K_HOT void cv1k_video_frame(struct cv1k_video *video, const cv1k_u8 *ram, cv1
             srcrow = video->vram1555 + sy * CV1K_VRAM_W + sx;
             for (x = 0UL; x < CV1K_SCREEN_W; x++) {
                 pix = srcrow[x];
+#if CV1K_VIDEO_DIAG_FRAME_COUNTS
                 frame_nonzero += ((pix & 0x7fffU) != 0U);
+#endif
                 dstrow[x] = rgb1555_to_rgb888(pix);
             }
         } else {
             for (x = 0UL; x < CV1K_SCREEN_W; x++) {
                 cv1k_u32 sxw = (sx + x) & (CV1K_VRAM_W - 1UL);
                 pix = video->vram1555[sy * CV1K_VRAM_W + sxw];
+#if CV1K_VIDEO_DIAG_FRAME_COUNTS
                 frame_nonzero += ((pix & 0x7fffU) != 0U);
+#endif
                 dstrow[x] = rgb1555_to_rgb888(pix);
             }
         }
     }
+#if CV1K_VIDEO_DIAG_FRAME_COUNTS
     video->last_frame_nonzero = frame_nonzero;
+#else
+    CV1K_UNUSED(frame_nonzero);
+    video->last_frame_nonzero = 0UL;
+#endif
 }
 
 
@@ -1286,11 +1865,12 @@ const char *cv1k_video_display_rotation_name(int rotation)
 
 int cv1k_video_display_rotation_auto_for_path(const char *path)
 {
-    /* Akai Katana's visible orientation differs from DDPSDOJ in this sandbox.
-     * Keep DDPSDOJ's historical ROT270/CCW frontend default, but use a 90-degree
-     * clockwise frontend transform for akatana.zip / extracted akatana trees.
-     */
-    if (cv1k_str_contains_fold(path, "akatana")) return CV1K_DISPLAY_ROT_CW;
+    if (cv1k_str_contains_fold(path, "akatana") ||
+        cv1k_str_contains_fold(path, "deathsml") ||
+        cv1k_str_contains_fold(path, "dsmbl") ||
+        cv1k_str_contains_fold(path, "mmmbanc") ||
+        cv1k_str_contains_fold(path, "mushitam") ||
+        cv1k_str_contains_fold(path, "mushitama")) return CV1K_DISPLAY_ROT_0;
     return CV1K_DISPLAY_ROT_CCW;
 }
 
@@ -1334,6 +1914,7 @@ CV1K_HOT cv1k_u32 cv1k_video_display_pixel(const struct cv1k_video *video, int r
     return video->screen_rgb[sy * CV1K_FRAMEBUFFER_W + sx];
 }
 
+
 CV1K_HOT void cv1k_video_make_display_xrgb8888(const struct cv1k_video *video, int rotation, cv1k_u32 *dst, cv1k_u32 dst_pitch)
 {
     cv1k_u32 w;
@@ -1351,9 +1932,13 @@ CV1K_HOT void cv1k_video_make_display_xrgb8888(const struct cv1k_video *video, i
         }
         break;
     case CV1K_DISPLAY_ROT_CW:
-        for (y = 0U; y < CV1K_SCREEN_W; y++) {
-            cv1k_u32 *d = dst + y * dst_pitch;
-            for (x = 0U; x < CV1K_SCREEN_H; x++) d[x] = video->screen_rgb[((CV1K_SCREEN_H - 1U) - x) * CV1K_FRAMEBUFFER_W + y];
+        for (y = 0U; y < CV1K_SCREEN_W; y += 8U) {
+            cv1k_u32 n = (CV1K_SCREEN_W - y < 8U) ? (CV1K_SCREEN_W - y) : 8U;
+            for (x = 0U; x < CV1K_SCREEN_H; x++) {
+                const cv1k_u32 *s = video->screen_rgb + ((CV1K_SCREEN_H - 1U) - x) * CV1K_FRAMEBUFFER_W + y;
+                cv1k_u32 k;
+                for (k = 0U; k < n; k++) dst[(y + k) * dst_pitch + x] = s[k];
+            }
         }
         break;
     case CV1K_DISPLAY_ROT_180:
@@ -1365,10 +1950,14 @@ CV1K_HOT void cv1k_video_make_display_xrgb8888(const struct cv1k_video *video, i
         break;
     case CV1K_DISPLAY_ROT_CCW:
     default:
-        for (y = 0U; y < CV1K_SCREEN_W; y++) {
-            cv1k_u32 *d = dst + y * dst_pitch;
+        for (y = 0U; y < CV1K_SCREEN_W; y += 8U) {
+            cv1k_u32 n = (CV1K_SCREEN_W - y < 8U) ? (CV1K_SCREEN_W - y) : 8U;
             cv1k_u32 sx = (CV1K_SCREEN_W - 1U) - y;
-            for (x = 0U; x < CV1K_SCREEN_H; x++) d[x] = video->screen_rgb[x * CV1K_FRAMEBUFFER_W + sx];
+            for (x = 0U; x < CV1K_SCREEN_H; x++) {
+                const cv1k_u32 *s = video->screen_rgb + x * CV1K_FRAMEBUFFER_W + sx;
+                cv1k_u32 k;
+                for (k = 0U; k < n; k++) dst[(y + k) * dst_pitch + x] = s[-(cv1k_s32)k];
+            }
         }
         break;
     }

@@ -46,6 +46,10 @@
 #define CV1K_REFRESH_MILLIHZ 60024UL
 #define CV1K_CYCLES_PER_VBLANK 1705984UL /* 102.4MHz / 60.024Hz, matching MAME CV1000 board clocks. */
 
+#ifndef CV1K_TMU_IRQ_AUTO_DEFER_FRAMES
+#define CV1K_TMU_IRQ_AUTO_DEFER_FRAMES 4000UL
+#endif
+
 /* The SH7709S on-chip TMU is fed by the peripheral module clock (Pphi), not the
  * CPU clock (Iphi).  On the CV1000 the CPG runs Pphi at Iphi/4, exactly like
  * MAME's sh34_base_device::sh4_parse_configuration (m_pm_clock = m_clock / 4),

@@ -95,6 +95,7 @@ struct cv1k_machine {
     cv1k_u32 dma_timer_chcr[4];
     cv1k_u32 dma_timer_base[4];
     cv1k_u32 dma_timer_mask;
+    cv1k_u32 event_schedule_serial;
     cv1k_u32 last_dma_nand_page0;
     cv1k_u32 last_dma_nand_page1;
     cv1k_u32 last_dma_nand_block0;
@@ -119,6 +120,7 @@ struct cv1k_machine {
     int render_screen;
     int mame_full_dmatcr;
     int mame_tmu_irq;
+    cv1k_u32 tmu_irq_defer_frames;
     int ir_jit;            /* use the experimental IR DRC run-frame (--ir-jit)  */
     int threaded_render;
     int threaded_audio;

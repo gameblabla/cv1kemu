@@ -498,6 +498,7 @@ static int ensure_tile_uploaded(struct cv1k_gles2_renderer *r, const struct cv1k
 static CV1K_ALWAYS_INLINE cv1k_u16 gles_read_ram16(const cv1k_u8 *ram, cv1k_u32 ram_size, cv1k_u32 addr)
 {
     if (ram == NULL || ram_size < 2U) return 0xffffU;
+    if (addr + 1U < ram_size) return cv1k_be16(&ram[addr]);
     addr %= ram_size;
     if (addr + 1U < ram_size) return cv1k_be16(&ram[addr]);
     return (cv1k_u16)(((cv1k_u16)ram[addr] << 8) | (cv1k_u16)ram[0]);
@@ -944,6 +945,10 @@ void cv1k_gles2_renderer_set_gpu_blitter(struct cv1k_gles2_renderer *r, struct c
     if (r->bound_video != NULL && r->bound_video != video) cv1k_video_set_gpu_accel(r->bound_video, NULL, NULL);
     r->bound_video = enable ? video : NULL;
     r->gpu_blitter_enabled = enable ? 1 : 0;
+    if (video != NULL) {
+        video->vram_dirty_tracking = (r->use_tile_cache || enable) ? 1 : 0;
+        if (video->vram_dirty_tracking) cv1k_video_mark_vram_dirty_all(video);
+    }
     if (enable && video != NULL) {
         cv1k_video_set_gpu_accel(video, &gles2_gpu_ops, r);
     } else if (video != NULL) {

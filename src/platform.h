@@ -11,6 +11,12 @@ int cv1k_read_file(const char *path, cv1k_u8 *dst, cv1k_u32 max_size, cv1k_u32 *
 int cv1k_write_file(const char *path, const cv1k_u8 *src, cv1k_u32 size);
 cv1k_u32 cv1k_now_unix(void);
 
+#ifdef CV1K_ENABLE_VFS
+void cv1k_vfs_clear(void);
+int cv1k_vfs_add_file_copy(const char *path, const cv1k_u8 *data, cv1k_u32 size);
+int cv1k_vfs_remove_file(const char *path);
+#endif
+
 cv1k_u16 cv1k_be16(const cv1k_u8 *p);
 cv1k_u32 cv1k_be32(const cv1k_u8 *p);
 void cv1k_put_be16(cv1k_u8 *p, cv1k_u16 v);

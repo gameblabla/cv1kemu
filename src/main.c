@@ -8,9 +8,11 @@
 #include "sh3_jit/cv1k_sh3_c23_jit.h"
 #include "sh3_jit/cv1k_ir.h"
 #include "threaded_runtime.h"
+#include "zmbv_recorder.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 #define MAX_INPUT_SCRIPT_EVENTS 64
 
@@ -25,6 +27,7 @@ static void usage(void)
     printf("cv1k-sandbox v53 ANSI C / SDL 1.2 audio-video-input frontend\n");
     printf("usage: cv1k_sandbox [options]\n");
     printf("  --model b|d           choose CV1000-B or CV1000-D RAM map\n");
+    printf("  romset.zip           shorthand for --romset romset.zip\n");
     printf("  --romset path         load ddpsdoj zip or extracted directory with u2/u4/u23/u24\n");
     printf("  --boot file           load U4 boot/program flash image\n");
     printf("  --nand file           load U2 NAND image\n");
@@ -49,6 +52,9 @@ static void usage(void)
     printf("  --dump-display-ppm file  dump the frontend-oriented screen instead of raw 320x240\n");
     printf("  --dump-ppm-series-dir dir  dump frame_XXXXXX.ppm captures during --run-frames\n");
     printf("  --dump-display-ppm-series-dir dir  dump frontend-oriented frame_XXXXXX.ppm captures during --run-frames\n");
+    printf("  --dump-zmbv file      record a silent Matroska/ZMBV video during --run-frames\n");
+    printf("  --dump-display-zmbv file  record a rotated frontend-oriented silent ZMBV video during --run-frames\n");
+    printf("  --dump-zmbv-checks file  write per-frame video hashes for backend comparison\n");
     printf("  --dump-series-every n  frame interval for --dump-*-series-dir, default 120\n");
     printf("  --threads            enable optional worker threads for video render conversion and audio mixing\n");
     printf("  --threaded-render    enable only threaded video-frame conversion when possible\n");
@@ -66,6 +72,9 @@ static void usage(void)
     printf("  --mame-trapa          vector SH7709S TRAPA like MAME instead of diagnostic no-vector mode\n");
     printf("  --mame-speedup        emulate MAME's DDPSDOJ spin-until-interrupt speedup\n");
     printf("  --mame-full-dmatcr    use MAME's full 0x1000000 zero-DMATCR count (diagnostic)\n");
+    printf("  --mame-tmu-irq       SH-3 TMU underflow IRQ delivery from reset (default)\n");
+    printf("  --no-tmu-irq         disable SH-3 TMU IRQ delivery for silent visual diagnostics\n");
+    printf("  --tmu-irq-defer n    defer TMU IRQ delivery by n frames for diagnostics\n");
     printf("  --wide-p0-alias      map broader SH P0 virtual aliases to CV1000-D work RAM\n");
     printf("  --vblank-irq-and-tick request IRQ2 but retain synthetic vblank RAM tick\n");
     printf("  --nand-scan          print physical NAND/OOB scan summary\n");
@@ -260,6 +269,117 @@ static int write_series_ppm(struct cv1k_machine *m, const char *dir, int display
     return 1;
 }
 
+
+static int capture_zmbv_check_frame(struct cv1k_machine *m,
+                                    struct cv1k_zmbv_recorder *rec,
+                                    FILE *checks,
+                                    int display,
+                                    cv1k_u32 *display_buf,
+                                    uint64_t frame_index,
+                                    cv1k_u32 *out_frame_hash,
+                                    cv1k_u32 *out_frame_nonzero)
+{
+    const cv1k_u32 *pixels;
+    cv1k_u32 w;
+    cv1k_u32 h;
+    cv1k_u32 stride;
+    cv1k_u32 hash = 0UL;
+    cv1k_u32 nonzero = 0UL;
+
+    if (m == NULL || (rec == NULL && checks == NULL)) return 1;
+    if (display) {
+        if (display_buf == NULL) return 0;
+        cv1k_video_display_dimensions(m->display_rotation, &w, &h);
+        cv1k_video_make_display_xrgb8888(&m->video, m->display_rotation, display_buf, w);
+        pixels = display_buf;
+        stride = w;
+    } else {
+        w = CV1K_SCREEN_W;
+        h = CV1K_SCREEN_H;
+        pixels = m->video.screen_rgb;
+        stride = CV1K_FRAMEBUFFER_W;
+    }
+    if (pixels == NULL) return 0;
+    if (rec != NULL) {
+        if (!cv1k_zmbv_recorder_add_xrgb8888(rec, pixels, w, h, stride, frame_index, &hash, &nonzero)) return 0;
+    } else {
+        cv1k_u32 x;
+        cv1k_u32 y;
+        hash = 2166136261UL;
+        nonzero = 0UL;
+        for (y = 0UL; y < h; y++) {
+            const cv1k_u32 *row = pixels + (size_t)y * stride;
+            for (x = 0UL; x < w; x++) {
+                cv1k_u32 p = row[x] & 0x00ffffffUL;
+                if (p != 0UL) nonzero++;
+                hash ^= p;
+                hash *= 16777619UL;
+            }
+        }
+    }
+    if (checks != NULL) {
+        fprintf(checks, "frame=%06llu hash=%08lx nonzero=%lu\n",
+                (unsigned long long)frame_index,
+                (unsigned long)hash,
+                (unsigned long)nonzero);
+        if (ferror(checks)) return 0;
+    }
+    if (out_frame_hash != NULL) *out_frame_hash = hash;
+    if (out_frame_nonzero != NULL) *out_frame_nonzero = nonzero;
+    return 1;
+}
+
+
+static int cv1k_arg_takes_value(const char *arg)
+{
+    if (arg == NULL) return 0;
+    return strcmp(arg, "--model") == 0 ||
+           strcmp(arg, "--boot") == 0 ||
+           strcmp(arg, "--romset") == 0 ||
+           strcmp(arg, "--nand") == 0 ||
+           strcmp(arg, "--sound") == 0 ||
+           strcmp(arg, "--eeprom") == 0 ||
+           strcmp(arg, "--ram") == 0 ||
+           strcmp(arg, "--input-map") == 0 ||
+           strcmp(arg, "--tap-input") == 0 ||
+           strcmp(arg, "--hold-input") == 0 ||
+           strcmp(arg, "--run-frames") == 0 ||
+           strcmp(arg, "--dump-audio") == 0 ||
+           strcmp(arg, "--cpu-backend") == 0 ||
+           strcmp(arg, "--rotate") == 0 ||
+           strcmp(arg, "--video-renderer") == 0 ||
+           strcmp(arg, "--dump-ram") == 0 ||
+           strcmp(arg, "--dump-nand") == 0 ||
+           strcmp(arg, "--dump-eeprom") == 0 ||
+           strcmp(arg, "--dump-ram-addr") == 0 ||
+           strcmp(arg, "--dump-ram-size") == 0 ||
+           strcmp(arg, "--trace-steps") == 0 ||
+           strcmp(arg, "--break-pc") == 0 ||
+           strcmp(arg, "--break-max") == 0 ||
+           strcmp(arg, "--run-break-pc") == 0 ||
+           strcmp(arg, "--save-state") == 0 ||
+           strcmp(arg, "--load-state") == 0 ||
+           strcmp(arg, "--dump-ppm") == 0 ||
+           strcmp(arg, "--dump-display-ppm") == 0 ||
+           strcmp(arg, "--dump-ppm-series-dir") == 0 ||
+           strcmp(arg, "--dump-display-ppm-series-dir") == 0 ||
+           strcmp(arg, "--dump-zmbv") == 0 ||
+           strcmp(arg, "--dump-display-zmbv") == 0 ||
+           strcmp(arg, "--dump-zmbv-checks") == 0 ||
+           strcmp(arg, "--dump-series-every") == 0 ||
+           strcmp(arg, "--blit") == 0;
+}
+
+static int cv1k_try_load_romset_arg(struct cv1k_machine *m, const char *path, struct cv1k_romset_report *rr, int *have_report)
+{
+    if (m == NULL || path == NULL || rr == NULL || have_report == NULL) return 0;
+    if (!cv1k_romset_load_ddpsdoj(m, path, rr)) {
+        fprintf(stderr, "warning: romset load not clean: %s\n", rr->message);
+    }
+    *have_report = 1;
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     struct cv1k_machine m;
@@ -268,6 +388,7 @@ int main(int argc, char **argv)
     int model;
     int i;
     int run_frames;
+    int exit_code;
     int sdl_requested;
     int sdl12_requested;
     int probe_requested;
@@ -283,6 +404,8 @@ int main(int argc, char **argv)
     int mame_speedup;
     int mame_full_dmatcr;
     int mame_tmu_irq;
+    int mame_tmu_irq_explicit;
+    cv1k_u32 tmu_irq_defer_frames;
     int wide_p0_alias;
     int compact_400_alias;
     int nand_data_only;
@@ -314,8 +437,11 @@ int main(int argc, char **argv)
     const char *dump_ppm;
     const char *dump_audio;
     const char *dump_display_ppm;
+    const char *dump_zmbv;
+    const char *dump_zmbv_checks;
     const char *dump_series_dir;
     int dump_series_display;
+    int dump_zmbv_display;
     int dump_series_every;
     struct input_script_event input_script[MAX_INPUT_SCRIPT_EVENTS];
     int input_script_count;
@@ -333,6 +459,7 @@ int main(int argc, char **argv)
 
     model = CV1K_MODEL_D;
     run_frames = -1;
+    exit_code = 0;
     sdl_requested = 0;
     sdl12_requested = 0;
     probe_requested = 0;
@@ -353,9 +480,12 @@ int main(int argc, char **argv)
     mame_trapa = 0;
     mame_speedup = 1;
     mame_full_dmatcr = 0;
-    /* TMU underflow interrupt drives the game's sound engine; the multi-source
-     * INTC now lets it coexist with the vblank IRQ, so enable it by default. */
+    /* Default to the MAME-compatible SH-3 TMU IRQ path.  Sound command
+     * delivery and coin/start input handling rely on this path being active
+     * from reset; --no-tmu-irq is retained only as a silent visual diagnostic. */
     mame_tmu_irq = 1;
+    mame_tmu_irq_explicit = 0;
+    tmu_irq_defer_frames = 0UL;
     wide_p0_alias = 0;
     compact_400_alias = 0;
     nand_data_only = 0;
@@ -387,8 +517,11 @@ int main(int argc, char **argv)
     dump_ppm = NULL;
     dump_audio = NULL;
     dump_display_ppm = NULL;
+    dump_zmbv = NULL;
+    dump_zmbv_checks = NULL;
     dump_series_dir = NULL;
     dump_series_display = 0;
+    dump_zmbv_display = 0;
     dump_series_every = 120;
     input_script_count = 0;
     blit_addr = 0UL;
@@ -420,7 +553,12 @@ int main(int argc, char **argv)
     m.irq2_enabled = irq2_enabled;
 
     for (i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--boot") == 0 && i + 1 < argc) {
+        if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
+            /* Consumed by the pre-init pass above; skip it here so valid
+             * invocations such as `--model d` do not produce a spurious
+             * unknown-option warning in the main option pass. */
+            i++;
+        } else if (strcmp(argv[i], "--boot") == 0 && i + 1 < argc) {
             i++;
             if (!cv1k_machine_load_boot(&m, argv[i])) fprintf(stderr, "warning: failed to load boot: %s\n", argv[i]);
         } else if (strcmp(argv[i], "--romset") == 0 && i + 1 < argc) {
@@ -494,8 +632,14 @@ int main(int argc, char **argv)
             mame_full_dmatcr = 1;
         } else if (strcmp(argv[i], "--mame-tmu-irq") == 0) {
             mame_tmu_irq = 1;
+            mame_tmu_irq_explicit = 1;
+            tmu_irq_defer_frames = 0UL;
         } else if (strcmp(argv[i], "--no-tmu-irq") == 0) {
             mame_tmu_irq = 0;
+            mame_tmu_irq_explicit = 1;
+        } else if (strcmp(argv[i], "--tmu-irq-defer") == 0 && i + 1 < argc) {
+            i++;
+            tmu_irq_defer_frames = parse_u32_arg(argv[i]);
         } else if (strcmp(argv[i], "--dump-audio") == 0 && i + 1 < argc) {
             i++;
             dump_audio = argv[i];
@@ -609,6 +753,17 @@ int main(int argc, char **argv)
             i++;
             dump_series_dir = argv[i];
             dump_series_display = 1;
+        } else if (strcmp(argv[i], "--dump-zmbv") == 0 && i + 1 < argc) {
+            i++;
+            dump_zmbv = argv[i];
+            dump_zmbv_display = 0;
+        } else if (strcmp(argv[i], "--dump-display-zmbv") == 0 && i + 1 < argc) {
+            i++;
+            dump_zmbv = argv[i];
+            dump_zmbv_display = 1;
+        } else if (strcmp(argv[i], "--dump-zmbv-checks") == 0 && i + 1 < argc) {
+            i++;
+            dump_zmbv_checks = argv[i];
         } else if (strcmp(argv[i], "--dump-series-every") == 0 && i + 1 < argc) {
             i++;
             dump_series_every = atoi(argv[i]);
@@ -617,7 +772,23 @@ int main(int argc, char **argv)
             i++;
             blit_addr = parse_u32_arg(argv[i]);
             blit_requested = 1;
+        } else if (argv[i][0] != '-') {
+            if (!have_report) {
+                cv1k_try_load_romset_arg(&m, argv[i], &rr, &have_report);
+            } else {
+                fprintf(stderr, "warning: ignoring extra positional argument: %s\n", argv[i]);
+            }
+        } else {
+            if (cv1k_arg_takes_value(argv[i]) && i + 1 >= argc) {
+                fprintf(stderr, "warning: option missing argument: %s\n", argv[i]);
+            } else {
+                fprintf(stderr, "warning: unknown option ignored: %s\n", argv[i]);
+            }
         }
+    }
+
+    if (!mame_tmu_irq_explicit && (sdl_requested || sdl12_requested || dump_audio != NULL)) {
+        mame_tmu_irq = 1;
     }
 
     if (c23_jit_requested) {
@@ -633,7 +804,7 @@ int main(int argc, char **argv)
     }
 
     if (display_rotation_requested == CV1K_DISPLAY_ROT_AUTO) {
-        m.display_rotation = have_report ? cv1k_video_display_rotation_auto_for_path(rr.source_path) : CV1K_DISPLAY_ROT_CCW;
+        m.display_rotation = have_report ? rr.display_rotation : CV1K_DISPLAY_ROT_CCW;
     } else {
         m.display_rotation = display_rotation_requested;
     }
@@ -651,7 +822,8 @@ int main(int argc, char **argv)
     m.mame_speedup = mame_speedup;
     m.mame_full_dmatcr = mame_full_dmatcr;
     m.mame_tmu_irq = mame_tmu_irq;
-    m.render_screen = profile_sh3_only ? 0 : 1;
+    m.tmu_irq_defer_frames = tmu_irq_defer_frames;
+    m.render_screen = (profile_sh3_only && dump_zmbv == NULL && dump_zmbv_checks == NULL) ? 0 : 1;
     if ((threaded_render_requested || threaded_audio_requested) && !cv1k_mt_supported()) {
         fprintf(stderr, "warning: threading was requested, but this build was made with THREADS=0; using single-threaded path\n");
         threaded_render_requested = 0;
@@ -692,11 +864,12 @@ int main(int argc, char **argv)
         m.mame_speedup = mame_speedup;
         m.mame_full_dmatcr = mame_full_dmatcr;
         m.mame_tmu_irq = mame_tmu_irq;
+        m.tmu_irq_defer_frames = tmu_irq_defer_frames;
         m.ir_jit = ir_jit_requested;
-        m.render_screen = profile_sh3_only ? 0 : 1;
+        m.render_screen = (profile_sh3_only && dump_zmbv == NULL && dump_zmbv_checks == NULL) ? 0 : 1;
         m.threaded_render = threaded_render_requested && m.render_screen;
         m.threaded_audio = threaded_audio_requested;
-        if (display_rotation_requested == CV1K_DISPLAY_ROT_AUTO) m.display_rotation = have_report ? cv1k_video_display_rotation_auto_for_path(rr.source_path) : CV1K_DISPLAY_ROT_CCW;
+        if (display_rotation_requested == CV1K_DISPLAY_ROT_AUTO) m.display_rotation = have_report ? rr.display_rotation : CV1K_DISPLAY_ROT_CCW;
         else m.display_rotation = display_rotation_requested;
         m.video_renderer = video_renderer_requested;
         m.gles2_tile_cache = gles2_tile_cache_requested;
@@ -769,12 +942,48 @@ int main(int argc, char **argv)
         cv1k_u32 a_accum = 0UL;
         cv1k_u32 a_total = 0UL;
         cv1k_u32 present_hash = 0UL;
+        cv1k_u32 zmbv_check_hash = 0UL;
+        cv1k_u32 zmbv_w = 0UL;
+        cv1k_u32 zmbv_h = 0UL;
+        cv1k_u32 *zmbv_display_buf = NULL;
+        struct cv1k_zmbv_recorder *zmbv_rec = NULL;
+        FILE *zmbv_checks = NULL;
         struct cv1k_mt_render *mt_render = NULL;
         struct cv1k_mt_audio *mt_audio = NULL;
         int mt_render_active = 0;
         int mt_audio_active = 0;
         int render_pending = 0;
-        if (m.threaded_render && !profile_sh3_only) {
+        if (dump_zmbv != NULL || dump_zmbv_checks != NULL) {
+            char err[256];
+            if (dump_zmbv_display) cv1k_video_display_dimensions(m.display_rotation, &zmbv_w, &zmbv_h);
+            else { zmbv_w = CV1K_SCREEN_W; zmbv_h = CV1K_SCREEN_H; }
+            if (dump_zmbv_display) {
+                zmbv_display_buf = (cv1k_u32 *)malloc((size_t)zmbv_w * (size_t)zmbv_h * sizeof(cv1k_u32));
+                if (zmbv_display_buf == NULL) {
+                    fprintf(stderr, "error: out of memory allocating ZMBV display capture buffer\n");
+                    exit_code = 2;
+                }
+            }
+            if (exit_code == 0 && dump_zmbv != NULL) {
+                err[0] = '\0';
+                zmbv_rec = cv1k_zmbv_recorder_open(dump_zmbv, zmbv_w, zmbv_h, CV1K_REFRESH_MILLIHZ, err, sizeof(err));
+                if (zmbv_rec == NULL) {
+                    fprintf(stderr, "error: %s\n", err[0] ? err : "failed to open ZMBV recorder");
+                    exit_code = 2;
+                }
+            }
+            if (exit_code == 0 && dump_zmbv_checks != NULL) {
+                zmbv_checks = fopen(dump_zmbv_checks, "wb");
+                if (zmbv_checks == NULL) {
+                    fprintf(stderr, "error: failed to open ZMBV checks file: %s\n", dump_zmbv_checks);
+                    exit_code = 2;
+                } else {
+                    fprintf(zmbv_checks, "# cv1k-zmbv-check-v1 width=%lu height=%lu refresh_millihz=%lu\n",
+                            (unsigned long)zmbv_w, (unsigned long)zmbv_h, (unsigned long)CV1K_REFRESH_MILLIHZ);
+                }
+            }
+        }
+        if (m.threaded_render && m.render_screen && exit_code == 0) {
             mt_render = cv1k_mt_render_create();
             mt_render_active = (mt_render != NULL);
             if (!mt_render_active) fprintf(stderr, "warning: threaded render worker unavailable; using single-threaded render path\n");
@@ -792,7 +1001,7 @@ int main(int argc, char **argv)
             cv1k_video_frame(&m.video, m.main_ram, m.main_ram_size);
             write_series_ppm(&m, dump_series_dir, dump_series_display, 0);
         }
-        for (i = 0; i < run_frames; i++) {
+        for (i = 0; i < run_frames && exit_code == 0; i++) {
             apply_input_script(&m.input, input_script, input_script_count, i);
             cv1k_machine_frame_advance(&m, mt_render_active ? 0 : m.render_screen);
             if (mt_render_active) {
@@ -842,6 +1051,21 @@ int main(int argc, char **argv)
                 }
                 present_hash = (present_hash * 33UL) ^ cv1k_video_present_checksum(&m.video);
             }
+            if ((zmbv_rec != NULL || zmbv_checks != NULL) && m.render_screen) {
+                cv1k_u32 frame_hash = 0UL;
+                cv1k_u32 frame_nonzero = 0UL;
+                if (render_pending) {
+                    cv1k_mt_render_wait(mt_render, &m.video);
+                    render_pending = 0;
+                }
+                if (!capture_zmbv_check_frame(&m, zmbv_rec, zmbv_checks, dump_zmbv_display, zmbv_display_buf, (uint64_t)i, &frame_hash, &frame_nonzero)) {
+                    fprintf(stderr, "error: ZMBV/check capture failed at frame %d: %s\n", i, cv1k_zmbv_recorder_error(zmbv_rec));
+                    exit_code = 2;
+                } else {
+                    zmbv_check_hash = (zmbv_check_hash * 33UL) ^ frame_hash;
+                    CV1K_UNUSED(frame_nonzero);
+                }
+            }
             if (dump_series_dir != NULL && dump_series_every > 0 && (((i + 1) % dump_series_every) == 0)) {
                 if (render_pending) {
                     cv1k_mt_render_wait(mt_render, &m.video);
@@ -858,6 +1082,22 @@ int main(int argc, char **argv)
             write_wav_header(af, CV1K_YMZ770_CLOCK_HZ / 1024UL, 2UL, a_total);
             fclose(af);
         }
+        if (zmbv_rec != NULL) {
+            if (!cv1k_zmbv_recorder_close(zmbv_rec)) {
+                fprintf(stderr, "error: closing ZMBV recording failed: %s\n", dump_zmbv != NULL ? dump_zmbv : "(null)");
+                exit_code = 2;
+            }
+            zmbv_rec = NULL;
+        }
+        if (zmbv_checks != NULL) {
+            if (fclose(zmbv_checks) != 0) {
+                fprintf(stderr, "error: closing ZMBV checks failed: %s\n", dump_zmbv_checks != NULL ? dump_zmbv_checks : "(null)");
+                exit_code = 2;
+            }
+            zmbv_checks = NULL;
+        }
+        free(zmbv_display_buf);
+        zmbv_display_buf = NULL;
         if (probe_requested) {
             compact_line(have_report ? &rr : NULL, l1, l2, l3);
             cv1k_machine_render_probe(&m, l1, l2, l3);
@@ -865,6 +1105,7 @@ int main(int argc, char **argv)
         cv1k_machine_status(&m, status, (cv1k_u32)sizeof(status));
         printf("%s\n", status);
         if (headless_present_check) printf("headless_present_checksum=%08lx\n", (unsigned long)present_hash);
+        if (dump_zmbv != NULL || dump_zmbv_checks != NULL) printf("zmbv_video_checksum=%08lx frames=%d\n", (unsigned long)zmbv_check_hash, run_frames);
         if (have_report) {
             cv1k_romset_report_text(&rr, status, (cv1k_u32)sizeof(status));
             printf("%s", status);
@@ -922,5 +1163,5 @@ int main(int argc, char **argv)
             (unsigned long)db, (unsigned long)dh, (unsigned long)df, (unsigned long)di);
     }
     cv1k_machine_shutdown(&m);
-    return 0;
+    return exit_code;
 }

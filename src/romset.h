@@ -18,11 +18,15 @@ struct cv1k_rom_entry_report {
 
 struct cv1k_romset_report {
     char set_name[32];
+    char description[160];
     char source_path[256];
     struct cv1k_rom_entry_report entry[CV1K_ROM_ENTRY_COUNT];
     cv1k_u32 boot_loaded;
     cv1k_u32 nand_loaded;
     cv1k_u32 sound_loaded;
+    cv1k_u32 idle_pc;
+    int display_rotation;
+    int model;
     int ok;
     int used_zip;
     char message[256];

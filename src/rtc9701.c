@@ -19,10 +19,20 @@ static cv1k_u8 bcd(cv1k_u32 x)
 
 static void rtc9701_load_time(struct cv1k_rtc9701 *rtc, cv1k_u32 now_unix)
 {
-    time_t raw;
-    struct tm *tmv;
-    raw = (time_t)now_unix;
-    tmv = localtime(&raw);
+#ifdef CV1K_WASM
+    /* The freestanding browser build has no timezone database.  Use a stable
+     * power-on timestamp so RTC reads are deterministic across browsers. */
+    CV1K_UNUSED(now_unix);
+    rtc->sec = bcd(0);
+    rtc->min = bcd(0);
+    rtc->hour = bcd(12);
+    rtc->day = bcd(1);
+    rtc->month = bcd(1);
+    rtc->year = bcd(26);
+    rtc->wday = 0x01U;
+#else
+    time_t raw = (time_t)now_unix;
+    struct tm *tmv = localtime(&raw);
     if (tmv == NULL) return;
     rtc->sec = bcd((cv1k_u32)tmv->tm_sec);
     rtc->min = bcd((cv1k_u32)tmv->tm_min);
@@ -32,6 +42,7 @@ static void rtc9701_load_time(struct cv1k_rtc9701 *rtc, cv1k_u32 now_unix)
     rtc->year = bcd((cv1k_u32)((tmv->tm_year + 1900) % 100));
     if (tmv->tm_wday == 0) rtc->wday = 0x01U;
     else rtc->wday = (cv1k_u8)(1U << (tmv->tm_wday - 1));
+#endif
 }
 
 static cv1k_u8 rtc9701_rtc_read(struct cv1k_rtc9701 *rtc, cv1k_u8 offset)

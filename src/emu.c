@@ -18,9 +18,32 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 
 
 #define CV1K_SH_SR_T 0x00000001UL
+
+static void cv1k_status_append(char **outp, cv1k_u32 *leftp, const char *fmt, ...)
+{
+    int n;
+    va_list ap;
+    if (outp == NULL || leftp == NULL || *outp == NULL || *leftp == 0UL) return;
+    va_start(ap, fmt);
+    n = vsnprintf(*outp, (size_t)*leftp, fmt, ap);
+    va_end(ap);
+    if (n < 0) {
+        (*outp)[0] = '\0';
+        *leftp = 0UL;
+        return;
+    }
+    if ((cv1k_u32)n >= *leftp) {
+        *outp += *leftp - 1UL;
+        *leftp = 1UL;
+    } else {
+        *outp += (cv1k_u32)n;
+        *leftp -= (cv1k_u32)n;
+    }
+}
 
 int cv1k_machine_init(struct cv1k_machine *m, int model)
 {
@@ -200,6 +223,7 @@ void cv1k_machine_reset(struct cv1k_machine *m)
     memset(m->dma_timer_chcr, 0, sizeof(m->dma_timer_chcr));
     memset(m->dma_timer_base, 0, sizeof(m->dma_timer_base));
     m->dma_timer_mask = 0UL;
+    m->event_schedule_serial = 1UL;
     m->last_dma_nand_page0 = 0UL;
     m->last_dma_nand_page1 = 0UL;
     m->last_dma_nand_block0 = 0UL;
@@ -914,10 +938,10 @@ void cv1k_machine_frame_advance(struct cv1k_machine *m, int render)
             if (++guard > (CV1K_CYCLES_PER_VBLANK * 4UL)) break;
         }
         cv1k_bus_tmu_tick(&m->bus);
-    } else if (m->mame_tmu_irq) {
-        /* Sound path: run the full frame, ticking the TMU finely so the sound
-         * timer ISR fires at its true rate.  No idle skip (the ISR must keep
-         * running while the main thread spins in its vblank wait). */
+    } else if (m->mame_tmu_irq && m->frames >= m->tmu_irq_defer_frames) {
+        /* MAME-compatible sound/input path: run the full frame while ticking
+         * TMU at a fine cadence so underflow IRQ delivery is active from reset.
+         * --no-tmu-irq enters the silent visual diagnostic path below. */
         if (m->ir_jit) cv1k_irjit_run_frame(&m->cpu, &m->bus, CV1K_CYCLES_PER_VBLANK, 2048UL);
         else sh7709s_run_frame(&m->cpu, &m->bus, CV1K_CYCLES_PER_VBLANK, 2048UL);
         m->last_active_pc = m->cpu.pc;
@@ -963,15 +987,20 @@ void cv1k_machine_frame(struct cv1k_machine *m)
 void cv1k_machine_status(const struct cv1k_machine *m, char *out, cv1k_u32 out_size)
 {
     char *p;
+    cv1k_u32 left;
+    if (out == NULL || out_size == 0UL) return;
+    if (m == NULL) { out[0] = '\0'; return; }
     p = out;
-    p += sprintf(p, "model=CV1000-%c pc=%08lx sr=%08lx frames=%lu cycles=%lu illegal=%lu ",
+    left = out_size;
+    out[0] = '\0';
+    cv1k_status_append(&p, &left, "model=CV1000-%c pc=%08lx sr=%08lx frames=%lu cycles=%lu illegal=%lu ",
         (m->model == CV1K_MODEL_D) ? 'D' : 'B',
         (unsigned long)m->cpu.pc,
         (unsigned long)m->cpu.sr,
         (unsigned long)m->frames,
         (unsigned long)m->cpu.cycles,
         (unsigned long)m->cpu.illegal_count);
-    p += sprintf(p, "last_illegal=%08lx:%04lx vbr=%08lx spc=%08lx irq_ack=%lu nand=%luB nand_r=%lu nand_w=%lu ",
+    cv1k_status_append(&p, &left, "last_illegal=%08lx:%04lx vbr=%08lx spc=%08lx irq_ack=%lu nand=%luB nand_r=%lu nand_w=%lu ",
         (unsigned long)m->cpu.last_illegal_pc,
         (unsigned long)m->cpu.last_illegal_op,
         (unsigned long)m->cpu.vbr,
@@ -980,7 +1009,7 @@ void cv1k_machine_status(const struct cv1k_machine *m, char *out, cv1k_u32 out_s
         (unsigned long)m->nand.size,
         (unsigned long)m->nand.reads,
         (unsigned long)m->nand.writes);
-    p += sprintf(p, "blit_ops=%lu up=%lu draw=%lu clip=%lu unk=%lu/%04lx bns=%lu hpen=%lu of=%lu ymz_writes=%lu ymz_reg=%lu ymz_key=%lu/%lu dma=%lu dma_bytes=%lu dmat=%lu%lu%lu%lu ",
+    cv1k_status_append(&p, &left, "blit_ops=%lu up=%lu draw=%lu clip=%lu unk=%lu/%04lx bns=%lu hpen=%lu of=%lu ymz_writes=%lu ymz_reg=%lu ymz_key=%lu/%lu dma=%lu dma_bytes=%lu dmat=%lu%lu%lu%lu ",
         (unsigned long)m->video.executed_ops,
         (unsigned long)m->video.upload_ops,
         (unsigned long)m->video.draw_ops,
@@ -1000,11 +1029,11 @@ void cv1k_machine_status(const struct cv1k_machine *m, char *out, cv1k_u32 out_s
         (unsigned long)m->dma_timer_active[1],
         (unsigned long)m->dma_timer_active[2],
         (unsigned long)m->dma_timer_active[3]);
-    p += sprintf(p, "vgpu=%lu/%lu/%lu ",
+    cv1k_status_append(&p, &left, "vgpu=%lu/%lu/%lu ",
         (unsigned long)m->video.gpu_attempted_ops,
         (unsigned long)m->video.gpu_executed_ops,
         (unsigned long)m->video.gpu_fallback_ops);
-    p += sprintf(p, "scroll=%lu/%lu clip=%ld,%ld,%ld,%ld list=%06lx lup=%06lx:%lu,%lu,%lu,%lu/%lu/%lu ldr=%06lx:%04lx/%04lx:%lu,%lu>%ld,%ld:%lu,%lu/%lu/%lu/%lu fnz=%lu ",
+    cv1k_status_append(&p, &left, "scroll=%lu/%lu clip=%ld,%ld,%ld,%ld list=%06lx lup=%06lx:%lu,%lu,%lu,%lu/%lu/%lu ldr=%06lx:%04lx/%04lx:%lu,%lu>%ld,%ld:%lu,%lu/%lu/%lu/%lu fnz=%lu ",
         (unsigned long)m->video.gfx_scroll_x,
         (unsigned long)m->video.gfx_scroll_y,
         (long)m->video.clip_x,
@@ -1032,7 +1061,7 @@ void cv1k_machine_status(const struct cv1k_machine *m, char *out, cv1k_u32 out_s
         (unsigned long)m->video.last_draw_written,
         (unsigned long)m->video.last_draw_written_nonzero,
         (unsigned long)m->video.last_frame_nonzero);
-    p += sprintf(p, "last_dma=%08lx>%08lx/%lu/%08lx/m%lu%lu/%08lx np=%lu-%lu nb=%lu-%lu nc=%lu-%lu irq_req=%lu/%lu/%08lx irqcpu=%lu/%lu/%04x ex=%lu/%08lx/%08lx ",
+    cv1k_status_append(&p, &left, "last_dma=%08lx>%08lx/%lu/%08lx/m%lu%lu/%08lx np=%lu-%lu nb=%lu-%lu nc=%lu-%lu irq_req=%lu/%lu/%08lx irqcpu=%lu/%lu/%04x ex=%lu/%08lx/%08lx ",
         (unsigned long)m->last_dma_sar,
         (unsigned long)m->last_dma_dar,
         (unsigned long)m->last_dma_tcr,
@@ -1055,7 +1084,7 @@ void cv1k_machine_status(const struct cv1k_machine *m, char *out, cv1k_u32 out_s
         (unsigned long)m->exception_events,
         (unsigned long)m->exception_last_event,
         (unsigned long)m->exception_last_tra);
-    p += sprintf(p, "tmu=%lu/%lu/%lu:%08lx/%lu assists=%lu fpga_bits=%lu fpga_done=%lu fpga_sum=%02lx fpga_fw=%ld icache=%lu/%lu ",
+    cv1k_status_append(&p, &left, "tmu=%lu/%lu/%lu:%08lx/%lu assists=%lu fpga_bits=%lu fpga_done=%lu fpga_sum=%02lx fpga_fw=%ld icache=%lu/%lu ",
         (unsigned long)m->tmu_underflows[0],
         (unsigned long)m->tmu_underflows[1],
         (unsigned long)m->tmu_underflows[2],
@@ -1068,7 +1097,7 @@ void cv1k_machine_status(const struct cv1k_machine *m, char *out, cv1k_u32 out_s
         (long)m->video.fpga_firmware_version,
         (unsigned long)m->icache_hits,
         (unsigned long)m->icache_misses);
-    p += sprintf(p, "dcache=%lu/%lu stale=%lu mcache=%d/%lu/%lu/%lu/%lu/%lu/%lu ctiming=%d/%lu/%lu cachectl=%d mtrap=%d mspeed=%d/%lu active=%08lx breg=%08lx/%08lx/%08lx/%08lx mmio=%lu/%08lx autoblit=%lu/%06lx-%06lx skip=%lu fulldma=%d mtmu=%d mt=%d/%d/%lu/%lu widep0=%d compact400=%d dmasync=%d dmainv=%lu ndata=%d ports=C%02x/%lu@%08lx D%02x/%lu@%08lx E%02x/%lu@%08lx F%02x/%lu@%08lx L%02x/%lu@%08lx nandcmd=%02lx pg=%lu col=%lu rnd=%lu spr=%lu nmap=%lu/%lu/%lu/%lu ce=%d ",
+    cv1k_status_append(&p, &left, "dcache=%lu/%lu stale=%lu mcache=%d/%lu/%lu/%lu/%lu/%lu/%lu ctiming=%d/%lu/%lu cachectl=%d mtrap=%d mspeed=%d/%lu active=%08lx breg=%08lx/%08lx/%08lx/%08lx mmio=%lu/%08lx autoblit=%lu/%06lx-%06lx skip=%lu fulldma=%d mtmu=%d/%lu mt=%d/%d/%lu/%lu widep0=%d compact400=%d dmasync=%d dmainv=%lu ndata=%d ports=C%02x/%lu@%08lx D%02x/%lu@%08lx E%02x/%lu@%08lx F%02x/%lu@%08lx L%02x/%lu@%08lx nandcmd=%02lx pg=%lu col=%lu rnd=%lu spr=%lu nmap=%lu/%lu/%lu/%lu ce=%d ",
         (unsigned long)m->dcache_hits,
         (unsigned long)m->dcache_misses,
         (unsigned long)m->dcache_dma_stale,
@@ -1099,6 +1128,7 @@ void cv1k_machine_status(const struct cv1k_machine *m, char *out, cv1k_u32 out_s
         (unsigned long)m->auto_blit_skips,
         m->mame_full_dmatcr,
         m->mame_tmu_irq,
+        (unsigned long)m->tmu_irq_defer_frames,
         m->threaded_render,
         m->threaded_audio,
         (unsigned long)m->threaded_render_jobs,
@@ -1123,7 +1153,7 @@ void cv1k_machine_status(const struct cv1k_machine *m, char *out, cv1k_u32 out_s
         (unsigned long)m->nand.map_oob_marked_blocks,
         (unsigned long)m->nand.map_spare_non_ff_pages,
         m->nand.ce_enabled);
-    p += sprintf(p, "alias=%lu/%lu/%lu/%lu/%lu/%lu tlb=%lu/%lu/%lu:%08lx>%08lx ",
+    cv1k_status_append(&p, &left, "alias=%lu/%lu/%lu/%lu/%lu/%lu tlb=%lu/%lu/%lu:%08lx>%08lx ",
         (unsigned long)m->alias_p1p2,
         (unsigned long)m->alias_p4,
         (unsigned long)m->alias_p0_wide,
@@ -1135,13 +1165,12 @@ void cv1k_machine_status(const struct cv1k_machine *m, char *out, cv1k_u32 out_s
         (unsigned long)m->tlb_misses,
         (unsigned long)m->tlb_last_virt,
         (unsigned long)m->tlb_last_phys);
-    sprintf(p, "unmapped_r=%lu last_r=%08lx unmapped_w=%lu last_w=%08lx:%02lx",
+    cv1k_status_append(&p, &left, "unmapped_r=%lu last_r=%08lx unmapped_w=%lu last_w=%08lx:%02lx",
         (unsigned long)m->unmapped_reads,
         (unsigned long)m->last_unmapped_read,
         (unsigned long)m->unmapped_writes,
         (unsigned long)m->last_unmapped_write,
         (unsigned long)m->last_unmapped_write_data);
-    CV1K_UNUSED(out_size);
 }
 
 void cv1k_machine_render_probe(struct cv1k_machine *m, const char *line1, const char *line2, const char *line3)

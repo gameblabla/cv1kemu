@@ -73,6 +73,7 @@ void cv1k_nand_shutdown(struct cv1k_nand *nand);
 int cv1k_nand_load(struct cv1k_nand *nand, const char *path);
 void cv1k_nand_reset(struct cv1k_nand *nand);
 cv1k_u8 cv1k_nand_data_r(struct cv1k_nand *nand);
+int cv1k_nand_data_read_bulk(struct cv1k_nand *nand, cv1k_u8 *dst, cv1k_u32 count);
 void cv1k_nand_data_w(struct cv1k_nand *nand, cv1k_u8 data);
 void cv1k_nand_command_w(struct cv1k_nand *nand, cv1k_u8 data);
 void cv1k_nand_address_w(struct cv1k_nand *nand, cv1k_u8 data);

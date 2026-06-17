@@ -108,6 +108,7 @@ struct cv1k_video {
     cv1k_s32 fpga_firmware_version;
     cv1k_u8 fpga_firmware_port;
     cv1k_u8 fpga_firmware_byte;
+    int vram_dirty_tracking;
     cv1k_u32 vram_dirty_generation;
     cv1k_u32 vram_tile_generation[CV1K_VRAM_TILE_COUNT];
     const struct cv1k_video_gpu_ops *gpu_ops;
@@ -115,6 +116,8 @@ struct cv1k_video {
     cv1k_u32 gpu_attempted_ops;
     cv1k_u32 gpu_executed_ops;
     cv1k_u32 gpu_fallback_ops;
+    cv1k_u8 *blit_shadow;
+    cv1k_u32 blit_shadow_capacity;
 };
 
 int cv1k_video_init(struct cv1k_video *video);

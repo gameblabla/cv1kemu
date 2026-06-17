@@ -10,9 +10,8 @@
 #include "sound_ymz770.h"
 #include "cv1k_config.h"
 #include "mame_mpeg_audio.h"
-#include <algorithm>
-#include <cstring>
-#include <new>
+#include <stdlib.h>
+#include <string.h>
 
 #define CV1K_YMZ770_IMPL_SLOTS 8
 #define CV1K_YMZ770_OUTPUT_BUF 0x1000
@@ -31,10 +30,10 @@ struct cv1k_ymz770_audio_impl {
     const cv1k_u8 *rom;
     cv1k_u32 rom_size;
     cv1k_u32 reset_cookie;
-    cv1k_ymz770_channel_audio ch[CV1K_YMZ770_CHANNELS];
+    struct cv1k_ymz770_channel_audio ch[CV1K_YMZ770_CHANNELS];
 };
 
-static cv1k_ymz770_audio_impl g_impls[CV1K_YMZ770_IMPL_SLOTS];
+static struct cv1k_ymz770_audio_impl g_impls[CV1K_YMZ770_IMPL_SLOTS];
 
 static int clamp_s32(int v, int lo, int hi)
 {
@@ -72,12 +71,12 @@ static cv1k_u32 get_seq_offs(const cv1k_u8 *rom, cv1k_u32 rom_size, int seq)
             (cv1k_u32)get_rom_byte(rom, rom_size, base + 3U);
 }
 
-static void impl_free_decoders(cv1k_ymz770_audio_impl *impl)
+static void impl_free_decoders(struct cv1k_ymz770_audio_impl *impl)
 {
     unsigned int i;
     if (impl == NULL) return;
     for (i = 0U; i < CV1K_YMZ770_CHANNELS; i++) {
-        delete impl->ch[i].decoder;
+        cv1k_mame_mpeg_audio_destroy(impl->ch[i].decoder);
         impl->ch[i].decoder = NULL;
         impl->ch[i].output_remaining = 0;
         impl->ch[i].output_ptr = 0;
@@ -86,10 +85,10 @@ static void impl_free_decoders(cv1k_ymz770_audio_impl *impl)
     }
 }
 
-static cv1k_ymz770_audio_impl *get_impl(struct cv1k_ymz770 *ymz, const cv1k_u8 *rom, cv1k_u32 rom_size)
+static struct cv1k_ymz770_audio_impl *get_impl(struct cv1k_ymz770 *ymz, const cv1k_u8 *rom, cv1k_u32 rom_size)
 {
     unsigned int i;
-    cv1k_ymz770_audio_impl *empty;
+    struct cv1k_ymz770_audio_impl *empty;
     empty = NULL;
     for (i = 0U; i < CV1K_YMZ770_IMPL_SLOTS; i++) {
         if (g_impls[i].key == ymz) {
@@ -106,7 +105,7 @@ static cv1k_ymz770_audio_impl *get_impl(struct cv1k_ymz770 *ymz, const cv1k_u8 *
     if (empty == NULL) {
         empty = &g_impls[0];
         impl_free_decoders(empty);
-        std::memset(empty, 0, sizeof(*empty));
+        memset(empty, 0, sizeof(*empty));
     }
     empty->key = ymz;
     empty->rom = rom;
@@ -115,21 +114,21 @@ static cv1k_ymz770_audio_impl *get_impl(struct cv1k_ymz770 *ymz, const cv1k_u8 *
     return empty;
 }
 
-static void ensure_decoders(cv1k_ymz770_audio_impl *impl, const cv1k_u8 *rom)
+static void ensure_decoders(struct cv1k_ymz770_audio_impl *impl, const cv1k_u8 *rom)
 {
     unsigned int i;
     if (impl == NULL || rom == NULL) return;
     for (i = 0U; i < CV1K_YMZ770_CHANNELS; i++) {
         if (impl->ch[i].decoder == NULL) {
-            impl->ch[i].decoder = new (std::nothrow) cv1k_mame_mpeg_audio(rom, cv1k_mame_mpeg_audio::AMM, false, 0);
+            impl->ch[i].decoder = cv1k_mame_mpeg_audio_create(rom, CV1K_MAME_MPEG_AUDIO_AMM, false, 0);
         }
     }
 }
 
-static void clear_channel_decoder(cv1k_ymz770_audio_impl *impl, unsigned int ch)
+static void clear_channel_decoder(struct cv1k_ymz770_audio_impl *impl, unsigned int ch)
 {
     if (impl == NULL || ch >= CV1K_YMZ770_CHANNELS) return;
-    if (impl->ch[ch].decoder != NULL) impl->ch[ch].decoder->clear();
+    if (impl->ch[ch].decoder != NULL) cv1k_mame_mpeg_audio_clear(impl->ch[ch].decoder);
     impl->ch[ch].output_remaining = 0;
     impl->ch[ch].output_ptr = 0;
 }
@@ -270,17 +269,17 @@ static void run_sequencer(struct cv1k_ymz770 *ymz, const cv1k_u8 *rom, cv1k_u32 
     }
 }
 
-extern "C" void cv1k_ymz770_mix_s16_stereo(struct cv1k_ymz770 *ymz,
+void cv1k_ymz770_mix_s16_stereo(struct cv1k_ymz770 *ymz,
                                             const cv1k_u8 *rom,
                                             cv1k_u32 rom_size,
                                             short *stereo,
                                             cv1k_u32 samples)
 {
-    cv1k_ymz770_audio_impl *impl;
+    struct cv1k_ymz770_audio_impl *impl;
     cv1k_u32 i;
     if (stereo == NULL) return;
     if (ymz == NULL || rom == NULL || rom_size == 0U) {
-        std::memset(stereo, 0, (size_t)samples * 2U * sizeof(short));
+        memset(stereo, 0, (size_t)samples * 2U * sizeof(short));
         return;
     }
 
@@ -296,7 +295,7 @@ extern "C" void cv1k_ymz770_mix_s16_stereo(struct cv1k_ymz770 *ymz,
 
         for (c = 0U; c < CV1K_YMZ770_CHANNELS; c++) {
             struct cv1k_ymz770_channel *ch = &ymz->channels[c];
-            cv1k_ymz770_channel_audio *ach = &impl->ch[c];
+            struct cv1k_ymz770_channel_audio *ach = &impl->ch[c];
 
             /* MAME's YMZ770 model deliberately "force finish[es] current block"
              * after a key-off: a channel with buffered decoded MPEG/AMM samples
@@ -338,7 +337,7 @@ retry_block:
                         int sample_rate = (int)(CV1K_YMZ770_CLOCK_HZ / 1024U);
                         int channel_count = 1;
                         int out_samples = 0;
-                        if (!ach->decoder->decode_buffer(ach->pptr, (int)(rom_size * 8U), ach->output_data, out_samples, sample_rate, channel_count, ach->atbl) || out_samples == 0) {
+                        if (!cv1k_mame_mpeg_audio_decode_buffer(ach->decoder, &ach->pptr, (int)(rom_size * 8U), ach->output_data, &out_samples, &sample_rate, &channel_count, ach->atbl) || out_samples == 0) {
                             ch->playing = ch->last_block ? 0U : 1U;
                             ch->last_block = 1U;
                             ach->output_remaining = 0;

@@ -105,8 +105,8 @@ struct cv1k_ir_backend {
     /* Emit native code for `blk` into `code` (capacity `cap`); record up to two
      * exit patch sites (byte offsets of the rel32) in `exit_site`.  Returns code
      * size, or 0 on failure (caller falls back to the legacy emitter). */
-    size_t (*emit)(const struct cv1k_ir_block *blk, const struct cv1k_ir_regplan *plan,
-                   cv1k_u8 *code, size_t cap, size_t exit_site[2]);
+    size_t (*emit_block)(const struct cv1k_ir_block *blk, const struct cv1k_ir_regplan *plan,
+                         cv1k_u8 *code, size_t cap, size_t exit_site[2]);
     /* Chaining: rewrite the rel32 at `site` within `code` to jump to `target`. */
     void (*patch_exit)(cv1k_u8 *code, size_t site, const cv1k_u8 *target);
     void (*unpatch_exit)(cv1k_u8 *code, size_t site, const cv1k_u8 *dispatch_trampoline);

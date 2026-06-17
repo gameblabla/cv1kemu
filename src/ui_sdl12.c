@@ -214,27 +214,60 @@ static void put_pixel(SDL_Surface *s, unsigned char *p, cv1k_u32 rgb)
 
 static void present_video32_scaled2(SDL_Surface *screen, const struct cv1k_video *video, int rotation)
 {
+    cv1k_u32 dx;
     cv1k_u32 dy;
     cv1k_u32 dst_w;
     cv1k_u32 dst_h;
     unsigned char *base;
     const SDL_PixelFormat *fmt;
+    if (video == NULL || video->screen_rgb == NULL) return;
+    if (rotation == CV1K_DISPLAY_ROT_AUTO) rotation = CV1K_DISPLAY_ROT_CCW;
     cv1k_video_display_dimensions(rotation, &dst_w, &dst_h);
     base = (unsigned char *)screen->pixels;
     fmt = screen->format;
-    for (dy = 0U; dy < dst_h; dy++) {
-        cv1k_u32 dx;
-        Uint32 *dst0 = (Uint32 *)(void *)(base + (dy * 2U + 0U) * (cv1k_u32)screen->pitch);
-        Uint32 *dst1 = (Uint32 *)(void *)(base + (dy * 2U + 1U) * (cv1k_u32)screen->pitch);
-        for (dx = 0U; dx < dst_w; dx++) {
-            Uint32 mapped = map_rgb32_fast(fmt, cv1k_video_display_pixel(video, rotation, dx, dy));
-            cv1k_u32 x2 = dx * 2U;
-            dst0[x2 + 0U] = mapped;
-            dst0[x2 + 1U] = mapped;
-            dst1[x2 + 0U] = mapped;
-            dst1[x2 + 1U] = mapped;
+#define PUT2X2(rgb_expr) do { \
+        Uint32 mapped = map_rgb32_fast(fmt, (rgb_expr)); \
+        cv1k_u32 x2 = dx * 2U; \
+        dst0[x2 + 0U] = mapped; \
+        dst0[x2 + 1U] = mapped; \
+        dst1[x2 + 0U] = mapped; \
+        dst1[x2 + 1U] = mapped; \
+    } while (0)
+    switch (rotation) {
+    case CV1K_DISPLAY_ROT_0:
+        for (dy = 0U; dy < CV1K_SCREEN_H; dy++) {
+            const cv1k_u32 *src = video->screen_rgb + dy * CV1K_FRAMEBUFFER_W;
+            Uint32 *dst0 = (Uint32 *)(void *)(base + (dy * 2U + 0U) * (cv1k_u32)screen->pitch);
+            Uint32 *dst1 = (Uint32 *)(void *)(base + (dy * 2U + 1U) * (cv1k_u32)screen->pitch);
+            for (dx = 0U; dx < CV1K_SCREEN_W; dx++) { PUT2X2(src[dx]); }
         }
+        break;
+    case CV1K_DISPLAY_ROT_CW:
+        for (dy = 0U; dy < CV1K_SCREEN_W; dy++) {
+            Uint32 *dst0 = (Uint32 *)(void *)(base + (dy * 2U + 0U) * (cv1k_u32)screen->pitch);
+            Uint32 *dst1 = (Uint32 *)(void *)(base + (dy * 2U + 1U) * (cv1k_u32)screen->pitch);
+            for (dx = 0U; dx < CV1K_SCREEN_H; dx++) { PUT2X2(video->screen_rgb[((CV1K_SCREEN_H - 1U) - dx) * CV1K_FRAMEBUFFER_W + dy]); }
+        }
+        break;
+    case CV1K_DISPLAY_ROT_180:
+        for (dy = 0U; dy < CV1K_SCREEN_H; dy++) {
+            const cv1k_u32 *src = video->screen_rgb + ((CV1K_SCREEN_H - 1U) - dy) * CV1K_FRAMEBUFFER_W;
+            Uint32 *dst0 = (Uint32 *)(void *)(base + (dy * 2U + 0U) * (cv1k_u32)screen->pitch);
+            Uint32 *dst1 = (Uint32 *)(void *)(base + (dy * 2U + 1U) * (cv1k_u32)screen->pitch);
+            for (dx = 0U; dx < CV1K_SCREEN_W; dx++) { PUT2X2(src[(CV1K_SCREEN_W - 1U) - dx]); }
+        }
+        break;
+    case CV1K_DISPLAY_ROT_CCW:
+    default:
+        for (dy = 0U; dy < CV1K_SCREEN_W; dy++) {
+            cv1k_u32 sx = (CV1K_SCREEN_W - 1U) - dy;
+            Uint32 *dst0 = (Uint32 *)(void *)(base + (dy * 2U + 0U) * (cv1k_u32)screen->pitch);
+            Uint32 *dst1 = (Uint32 *)(void *)(base + (dy * 2U + 1U) * (cv1k_u32)screen->pitch);
+            for (dx = 0U; dx < CV1K_SCREEN_H; dx++) { PUT2X2(video->screen_rgb[dx * CV1K_FRAMEBUFFER_W + sx]); }
+        }
+        break;
     }
+#undef PUT2X2
 }
 
 static void present_video(SDL_Surface *screen, const struct cv1k_video *video, int rotation)

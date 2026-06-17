@@ -265,12 +265,14 @@ static CV1K_HOT void tmu_update_channel(struct cv1k_machine *m, int ch)
 CV1K_HOT void cv1k_bus_tmu_tick(struct cv1k_bus *bus)
 {
     struct cv1k_machine *m;
+    cv1k_u8 tstr;
     m = bus ? bus->machine : NULL;
     if (m == NULL) return;
     dmac_complete_timers(m);
-    tmu_update_channel(m, 0);
-    tmu_update_channel(m, 1);
-    tmu_update_channel(m, 2);
+    tstr = m->sh_io[0xfe92UL & (CV1K_REGION_SH_IO_SIZE - 1UL)];
+    if ((tstr & 0x01U) != 0U) tmu_update_channel(m, 0);
+    if ((tstr & 0x02U) != 0U) tmu_update_channel(m, 1);
+    if ((tstr & 0x04U) != 0U) tmu_update_channel(m, 2);
 }
 
 CV1K_HOT cv1k_u32 cv1k_bus_cycles_until_event(struct cv1k_bus *bus)
@@ -301,12 +303,23 @@ CV1K_HOT cv1k_u32 cv1k_bus_cycles_until_event(struct cv1k_bus *bus)
         cv1k_u16 tcr;
         cv1k_u32 div;
         cv1k_u32 tcnt;
+        cv1k_u32 last;
+        cv1k_u32 elapsed;
+        cv1k_u32 ticks_elapsed;
+        cv1k_u32 frac;
         cv1k_u32 delta;
         if ((tstr & (1U << ch)) == 0U) continue;
         tcr = shio_read_be16(m, tmu_tcr_off(ch));
         div = divs[tcr & 7U] * CV1K_TMU_PCLK_DIV;
         tcnt = shio_read_be32(m, tmu_tcnt_off(ch));
-        delta = (tcnt == 0xffffffffUL) ? 0xffffffffUL : ((tcnt + 1UL) * div);
+        last = m->tmu_last_cycles[ch];
+        if (last == 0UL) { if (0UL < best) best = 0UL; continue; }
+        elapsed = now - last;
+        ticks_elapsed = elapsed / div;
+        frac = elapsed - ticks_elapsed * div;
+        if (tcnt == 0xffffffffUL) delta = 0xffffffffUL;
+        else if (ticks_elapsed > tcnt) delta = 0UL;
+        else delta = ((tcnt - ticks_elapsed + 1UL) * div) - frac;
         if (delta < best) best = delta;
     }
     return best;
@@ -363,10 +376,12 @@ static void dmac_complete_timers(struct cv1k_machine *m)
 {
     cv1k_u32 mask;
     cv1k_u32 now;
+    cv1k_u32 completed;
     if (m == NULL) return;
     mask = m->dma_timer_mask;
     if (CV1K_LIKELY(mask == 0UL)) return;
     now = m->cpu.cycles;
+    completed = 0UL;
     while (mask != 0UL) {
         cv1k_u32 bit = mask & (0UL - mask);
         cv1k_u32 ch = (cv1k_u32)__builtin_ctz(mask);
@@ -377,9 +392,11 @@ static void dmac_complete_timers(struct cv1k_machine *m)
             shio_write_be32(m, base + 0x0cUL, (chcr & ~1UL) | 2UL);
             m->dma_timer_active[ch] = 0UL;
             m->dma_timer_mask &= ~bit;
+            completed = 1UL;
         }
         mask ^= bit;
     }
+    if (completed != 0UL) m->event_schedule_serial++;
 }
 
 static void dmac_schedule_completion(struct cv1k_machine *m, cv1k_u32 base, cv1k_u32 chcr, cv1k_u32 transfers)
@@ -401,6 +418,7 @@ static void dmac_schedule_completion(struct cv1k_machine *m, cv1k_u32 base, cv1k
     m->dma_timer_due[ch] = m->cpu.cycles + delay;
     m->dma_timer_chcr[ch] = chcr;
     m->dma_timer_base[ch] = base;
+    m->event_schedule_serial++;
 }
 
 static int dmac_try_fast_nand_data_to_ram(struct cv1k_machine *m, cv1k_u32 *sar, cv1k_u32 *dar, cv1k_u32 tcr, cv1k_u32 src_mode, cv1k_u32 dst_mode, cv1k_u32 unit)
@@ -432,6 +450,13 @@ static int dmac_try_fast_nand_data_to_ram(struct cv1k_machine *m, cv1k_u32 *sar,
      * beyond mapped work RAM are ignored, matching the effective behavior of
      * MAME's address map.
      */
+    if (!m->dcache_enabled && !m->dma_cache_sync && max_ram == tcr && tcr != 0UL) {
+        if (cv1k_nand_data_read_bulk(&m->nand, &m->main_ram[dst_phys - CV1K_ADDR_WORK_RAM], tcr)) {
+            *dar += tcr;
+            return 1;
+        }
+    }
+
     for (i = 0UL; i < tcr; i++) {
         data = cv1k_nand_data_r(&m->nand);
         if (i < max_ram) {
@@ -621,6 +646,8 @@ static CV1K_HOT cv1k_u8 sh_io_port_r(struct cv1k_machine *m, cv1k_u32 off)
 static CV1K_HOT void sh_io_port_w(struct cv1k_machine *m, cv1k_u32 off, cv1k_u8 data)
 {
     int tmu_ch;
+    int tmu_schedule_dirty;
+    tmu_schedule_dirty = 0;
     dmac_complete_timers(m);
     if (off == 0xfe92UL) {
         tmu_update_channel(m, 0);
@@ -654,10 +681,12 @@ static CV1K_HOT void sh_io_port_w(struct cv1k_machine *m, cv1k_u32 off, cv1k_u8 
         if ((data & 1U) != 0U) m->tmu_last_cycles[0] = now;
         if ((data & 2U) != 0U) m->tmu_last_cycles[1] = now;
         if ((data & 4U) != 0U) m->tmu_last_cycles[2] = now;
+        tmu_schedule_dirty = 1;
     } else {
         tmu_ch = tmu_channel_from_off(off);
         if (tmu_ch >= 0) {
             m->tmu_last_cycles[tmu_ch] = m->cpu.cycles;
+            tmu_schedule_dirty = 1;
             if ((off & ~1UL) == tmu_tcr_off(tmu_ch)) {
                 cv1k_u16 tcr_now;
                 cv1k_u32 event;
@@ -672,6 +701,7 @@ static CV1K_HOT void sh_io_port_w(struct cv1k_machine *m, cv1k_u32 off, cv1k_u8 
             }
         }
     }
+    if (tmu_schedule_dirty) m->event_schedule_serial++;
     if (off >= 0xffe0UL && off <= 0xffffUL) {
         /* v43: match MAME's SH3 CCN/MMU register map.  Earlier sandbox
          * revisions accidentally used 0xffff_ff60/64/70, which are BSC
@@ -691,6 +721,35 @@ static CV1K_HOT void sh_io_port_w(struct cv1k_machine *m, cv1k_u32 off, cv1k_u8 
         cv1k_bus_invalidate_dcache_all(&m->bus);
     }
     maybe_sh_dma(m, off);
+}
+
+static CV1K_HOT int sh_io_port_j_write32_fast(struct cv1k_machine *m, cv1k_u32 off, cv1k_u32 data)
+{
+    cv1k_u32 idx;
+    cv1k_u8 b0;
+    cv1k_u8 b1;
+    cv1k_u8 b2;
+    cv1k_u8 b3;
+    if (m == NULL) return 0;
+    if ((off & 3UL) != 0UL || (off & ~7UL) != 0xc0UL) return 0;
+
+    /* The FPGA bit-stream loader is hit through aligned 32-bit stores to the
+     * SH7709S PORT_J data window.  The byte path is correct but very costly:
+     * it translates/splits the longword, probes DMA completion and re-enters
+     * the generic SH-I/O dispatcher four times even though PORT_J has no DMAC
+     * or TMU side effects.  Preserve the externally visible byte order while
+     * paying the timer-completion check once for the whole bus cycle. */
+    dmac_complete_timers(m);
+    idx = off & (CV1K_REGION_SH_IO_SIZE - 1UL);
+    b0 = (cv1k_u8)((data >> 24) & 0xffU);
+    b1 = (cv1k_u8)((data >> 16) & 0xffU);
+    b2 = (cv1k_u8)((data >> 8) & 0xffU);
+    b3 = (cv1k_u8)(data & 0xffU);
+    cv1k_video_fpga_write(&m->video, b0); m->sh_io[idx] = b0;
+    cv1k_video_fpga_write(&m->video, b1); m->sh_io[(idx + 1UL) & (CV1K_REGION_SH_IO_SIZE - 1UL)] = b1;
+    cv1k_video_fpga_write(&m->video, b2); m->sh_io[(idx + 2UL) & (CV1K_REGION_SH_IO_SIZE - 1UL)] = b2;
+    cv1k_video_fpga_write(&m->video, b3); m->sh_io[(idx + 3UL) & (CV1K_REGION_SH_IO_SIZE - 1UL)] = b3;
+    return 1;
 }
 
 void cv1k_bus_ldtlb(struct cv1k_bus *bus)
@@ -1553,6 +1612,9 @@ CV1K_HOT void cv1k_bus_write32(struct cv1k_bus *bus, cv1k_u32 addr, cv1k_u32 dat
             if (CV1K_UNLIKELY(m->mame_cache_meta)) mame_cache_meta_access(m, original_addr, phys, 1, 0);
             cv1k_video_write32(&m->video, phys - CV1K_ADDR_BLITTER, data, m->main_ram, m->main_ram_size);
             return;
+        }
+        if (in_range(phys, CV1K_ADDR_SH_IO, CV1K_REGION_SH_IO_SIZE)) {
+            if (sh_io_port_j_write32_fast(m, phys - CV1K_ADDR_SH_IO, data)) return;
         }
         if (in_range(phys, CV1K_ADDR_WORK_RAM, m->main_ram_size) && !m->dcache_enabled) {
             cv1k_u32 off = phys - CV1K_ADDR_WORK_RAM;

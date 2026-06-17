@@ -838,7 +838,7 @@ void MOVLL(uint32_t m, uint32_t n)
 /*  MOV.B   Rm,@-Rn */
 void MOVBM(uint32_t m, uint32_t n)
 {
-	uint8_t data(m_sh2_state->r[m]);
+	uint8_t data = (uint8_t)m_sh2_state->r[m];
 
 	m_sh2_state->r[n] -= 1;
 	write_byte(m_sh2_state->r[n], data);
@@ -847,7 +847,7 @@ void MOVBM(uint32_t m, uint32_t n)
 /*  MOV.W   Rm,@-Rn */
 void MOVWM(uint32_t m, uint32_t n)
 {
-	uint16_t data(m_sh2_state->r[m]);
+	uint16_t data = (uint16_t)m_sh2_state->r[m];
 
 	m_sh2_state->r[n] -= 2;
 	write_word(m_sh2_state->r[n], data);
