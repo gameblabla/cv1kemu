@@ -391,6 +391,11 @@ public:
         update();
     }
 protected:
+    void mousePressEvent(QMouseEvent *event) override
+    {
+        setFocus(Qt::MouseFocusReason);
+        QWidget::mousePressEvent(event);
+    }
     void paintEvent(QPaintEvent *) override
     {
         QPainter p(this);
@@ -439,6 +444,7 @@ public:
     ~MainWindow() override
     {
         saveSettings();
+        releaseGameplayKeyboard();
         if (appInstance) appInstance->removeEventFilter(this);
         shutdownGamepadInput();
         stopAudio();
@@ -485,6 +491,7 @@ public:
         frameClock.restart();
         setWindowTitle(QStringLiteral("CV1000 Qt6 - %1").arg(QString::fromLatin1(report.set_name)));
         statusBar()->showMessage(QString::fromLatin1(report.message));
+        scheduleGameplayKeyboardGrab();
         runOneFrame();
         return true;
     }
@@ -494,6 +501,16 @@ protected:
         CV1K_UNUSED(watched);
         if (event->type() == QEvent::ApplicationDeactivate || event->type() == QEvent::WindowDeactivate) {
             clearInputState();
+            releaseGameplayKeyboard();
+        } else if (event->type() == QEvent::ApplicationActivate || event->type() == QEvent::WindowActivate) {
+            scheduleGameplayKeyboardGrab();
+        }
+        if (event->type() == QEvent::ShortcutOverride) {
+            QKeyEvent *keyEvent = static_cast<QKeyEvent *>(event);
+            if (shouldCaptureGameplayKey(keyEvent) && isHandledGameplayKey(keyEvent->key())) {
+                event->accept();
+                return true;
+            }
         }
         if (event->type() == QEvent::KeyPress || event->type() == QEvent::KeyRelease) {
             QKeyEvent *keyEvent = static_cast<QKeyEvent *>(event);
@@ -675,11 +692,13 @@ private:
 
     void openRomDialog()
     {
+        releaseGameplayKeyboard();
         SimpleZipOpenDialog dlg(lastRomDir, this);
         if (dlg.exec() == QDialog::Accepted) {
             const QString file = dlg.fileName();
             if (!file.isEmpty()) loadRom(file);
         }
+        scheduleGameplayKeyboardGrab();
     }
 
     void setStateSlot(int slot)
@@ -770,6 +789,7 @@ private:
 
     void configureSettings()
     {
+        releaseGameplayKeyboard();
         QDialog dlg(this);
         dlg.setWindowTitle(QStringLiteral("CV1000 Settings"));
         dlg.resize(440, 220);
@@ -808,6 +828,7 @@ private:
             saveSettings();
             statusBar()->showMessage(useIrJit ? QStringLiteral("Settings applied: IR JIT") : QStringLiteral("Settings applied: interpreter"));
         }
+        scheduleGameplayKeyboardGrab();
     }
 
     QWidget *makeControlsPage(const QString &title, const int *ids, int count, int *tmpKeys, int *tmpPads, std::vector<KeyButton *> *keyButtons, std::vector<PadButton *> *padButtons, QWidget *parent)
@@ -857,6 +878,7 @@ private:
 
     void configureControls()
     {
+        releaseGameplayKeyboard();
         int tmpKeys[CV1K_INPUT_COUNT];
         int tmpPads[CV1K_INPUT_COUNT];
         std::memcpy(tmpKeys, keymap, sizeof(tmpKeys));
@@ -911,6 +933,21 @@ private:
             clearInputState();
             saveSettings();
         }
+        scheduleGameplayKeyboardGrab();
+    }
+
+    bool isMappedGameplayKey(int qtKey) const
+    {
+        if (!loaded || qtKey == 0) return false;
+        for (int i = 0; i < CV1K_INPUT_COUNT; ++i) {
+            if (keymap[i] == qtKey) return true;
+        }
+        return false;
+    }
+
+    bool isHandledGameplayKey(int qtKey) const
+    {
+        return qtKey == Qt::Key_Escape || qtKey == Qt::Key_F5 || qtKey == Qt::Key_F8 || isMappedGameplayKey(qtKey);
     }
 
     bool shouldCaptureGameplayKey(QKeyEvent *event) const
@@ -925,6 +962,25 @@ private:
             if (qobject_cast<QLineEdit *>(focus) || qobject_cast<QSpinBox *>(focus) || qobject_cast<QComboBox *>(focus)) return false;
         }
         return true;
+    }
+
+    void scheduleGameplayKeyboardGrab()
+    {
+        QTimer::singleShot(0, this, [this]() { grabGameplayKeyboard(); });
+    }
+
+    void grabGameplayKeyboard()
+    {
+        if (!loaded || !video || QApplication::activeModalWidget() != nullptr) return;
+        if (isVisible() && isActiveWindow()) {
+            video->setFocus(Qt::OtherFocusReason);
+            if (QWidget::keyboardGrabber() != video) video->grabKeyboard();
+        }
+    }
+
+    void releaseGameplayKeyboard()
+    {
+        if (video && QWidget::keyboardGrabber() == video) video->releaseKeyboard();
     }
 
     bool handleGameplayKey(QKeyEvent *event, bool pressed)
@@ -1100,8 +1156,32 @@ private:
                     finishGamepadCapture(encodeGamepadAxis(pad, int(e.gaxis.axis), value > 0));
                     continue;
                 }
-                setGamepadAxisInput(pad, int(e.gaxis.axis), value);
             }
+        }
+        SDL_UpdateGamepads();
+        cv1k_u32 newMask = 0;
+        for (int i = 0; i < CV1K_INPUT_COUNT; ++i) {
+            const int code = gamepadMap[i];
+            const int pad = gamepadBindingPad(code);
+            if (pad < 0 || pad >= 4 || gamepads[pad] == nullptr) continue;
+            if (isGamepadButtonBinding(code)) {
+                const int button = gamepadBindingButton(code);
+                if (button >= 0 && button < SDL_GAMEPAD_BUTTON_COUNT &&
+                    SDL_GetGamepadButton(gamepads[pad], SDL_GamepadButton(button))) {
+                    newMask |= (1UL << i);
+                }
+            } else if (isGamepadAxisBinding(code)) {
+                const int axis = gamepadBindingAxis(code);
+                if (axis >= 0 && axis < SDL_GAMEPAD_AXIS_COUNT) {
+                    const short value = short(SDL_GetGamepadAxis(gamepads[pad], SDL_GamepadAxis(axis)));
+                    const bool active = gamepadBindingPositive(code) ? (value > kGamepadAxisDeadZone) : (value < -kGamepadAxisDeadZone);
+                    if (active) newMask |= (1UL << i);
+                }
+            }
+        }
+        if (newMask != gamepadInputMask) {
+            gamepadInputMask = newMask;
+            syncInputMask();
         }
 #endif
     }

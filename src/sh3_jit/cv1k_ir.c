@@ -683,8 +683,9 @@ static const int GPOOL[] = { RSI, RDI, R8, R9, R10, R11, RBX, R14, R15 };
 #define NG ((int)(sizeof GPOOL / sizeof GPOOL[0]))
 
 /* Diagnostic toggle: when 0, guest regs are never cached (all GLOAD/GSTORE go to
- * memory) — used by the microbench to measure the register-allocation win. */
-static int g_ir_cache_on = 1;
+ * memory).  Keep production on the conservative memory-backed path; the
+ * differential tester enables this explicitly when exercising the allocator. */
+static int g_ir_cache_on = 0;
 void cv1k_ir_set_cache(int on) { g_ir_cache_on = on ? 1 : 0; }
 /* Inline work-RAM access is safe in the default fast build; cache-accurate builds
  * still emit the bus/cache hook before direct RAM access. */
@@ -693,7 +694,7 @@ void cv1k_ir_set_fastram(int on) { g_ir_fastram_on = on ? 1 : 0; }
 /* Internal-loop (back-branch) chaining: ON for the isolated bench/test, but OFF
  * in production (a loop block has no mid-loop IRQ/cycle checks, so an IRQ-waiting
  * spin loop would hang and a long loop would overrun the cycle budget). */
-static int g_ir_internal_loops = 1;
+static int g_ir_internal_loops = 0;
 void cv1k_ir_set_internal_loops(int on) { g_ir_internal_loops = on ? 1 : 0; }
 static cv1k_u32 g_ir_last_compile_cycles = 0;
 

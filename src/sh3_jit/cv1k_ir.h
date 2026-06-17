@@ -121,7 +121,7 @@ typedef cv1k_u32 (*cv1k_ir_block_fn)(struct sh7709s_cpu *, struct cv1k_bus *);
 
 /* 1 if `op` is in the phase-1 IR-lowerable subset (straight-line ALU/move). */
 int cv1k_ir_phase1_supported(cv1k_u16 op);
-void cv1k_ir_set_cache(int on);   /* 1 = register-allocate guest regs (default) */
+void cv1k_ir_set_cache(int on);   /* 1 = register-allocate guest regs (test only) */
 void cv1k_ir_set_fastram(int on); /* 1 = inline work-RAM access (default)       */
 void cv1k_ir_set_internal_loops(int on); /* back-branch loop chaining (test only) */
 
