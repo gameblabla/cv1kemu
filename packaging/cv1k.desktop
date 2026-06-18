@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=CV1000 Emulator
+Comment=Cave CV1000 emulator
+Exec=cv1kemu_qt6 %f
+Icon=cv1k
+Terminal=false
+Categories=Game;Emulator;
+MimeType=application/zip;

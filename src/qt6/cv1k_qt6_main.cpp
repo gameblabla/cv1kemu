@@ -17,21 +17,22 @@
 #include <QtGui/QMouseEvent>
 #include <QtGui/QPainter>
 #include <QtGui/QShortcut>
+#include <QtMultimedia/QAudio>
 #include <QtMultimedia/QAudioFormat>
 #include <QtMultimedia/QAudioSink>
 #include <QtWidgets/QApplication>
+#include <QtWidgets/QButtonGroup>
 #include <QtWidgets/QCheckBox>
-#include <QtWidgets/QAbstractItemView>
 #include <QtWidgets/QComboBox>
 #include <QtWidgets/QDialog>
 #include <QtWidgets/QDialogButtonBox>
 #include <QtWidgets/QFormLayout>
 #include <QtWidgets/QGroupBox>
 #include <QtWidgets/QHBoxLayout>
+#include <QtWidgets/QFileDialog>
 #include <QtWidgets/QInputDialog>
 #include <QtWidgets/QLabel>
 #include <QtWidgets/QLineEdit>
-#include <QtWidgets/QListWidget>
 #include <QtWidgets/QMainWindow>
 #include <QtWidgets/QMenu>
 #include <QtWidgets/QMenuBar>
@@ -68,9 +69,24 @@ extern "C" {
 }
 
 static constexpr unsigned kAudioRate = CV1K_YMZ770_CLOCK_HZ / 1024U;
-static constexpr unsigned kQtAudioStartFrames = 1024U;
-static constexpr unsigned kQtAudioMaxLatencyFrames = 4096U;
+static constexpr unsigned kQtAudioBytesPerFrame = 2U * unsigned(sizeof(short));
+static constexpr unsigned kQtAudioStartFrames = 2048U;
+static constexpr unsigned kQtAudioMaxLatencyFrames = 8192U;
+static constexpr unsigned kQtAudioPendingMaxFrames = 4096U;
 static constexpr int kDefaultScale = 2;
+
+enum QtDisplayScaleMode {
+    kQtScaleKeepAspect = 0,
+    kQtScaleFullStretch = 1,
+    kQtScaleInteger = 2
+};
+
+static int clampDisplayScaleMode(int mode)
+{
+    if (mode < kQtScaleKeepAspect || mode > kQtScaleInteger) return kQtScaleKeepAspect;
+    return mode;
+}
+
 static constexpr qint64 kQtFrameNs = qint64(1000000000000LL / CV1K_REFRESH_MILLIHZ);
 static constexpr qint64 kQtNsPerMs = 1000000LL;
 
@@ -256,127 +272,6 @@ private:
     bool capturing = false;
 };
 
-class SimpleZipOpenDialog final : public QDialog {
-public:
-    explicit SimpleZipOpenDialog(const QString &startDir, QWidget *parent = nullptr) : QDialog(parent)
-    {
-        setWindowTitle(QStringLiteral("Open CV1000 ROM zip"));
-        resize(720, 480);
-        QVBoxLayout *outer = new QVBoxLayout(this);
-
-        QHBoxLayout *pathRow = new QHBoxLayout();
-        QPushButton *up = new QPushButton(QStringLiteral("Up"), this);
-        pathEdit = new QLineEdit(this);
-        pathEdit->setReadOnly(false);
-        pathRow->addWidget(up);
-        pathRow->addWidget(pathEdit, 1);
-        outer->addLayout(pathRow);
-
-        list = new QListWidget(this);
-        list->setSelectionMode(QAbstractItemView::SingleSelection);
-        list->setAlternatingRowColors(true);
-        outer->addWidget(list, 1);
-
-        QLabel *hint = new QLabel(QStringLiteral("Select a .zip ROM set. This built-in dialog avoids KDE/Plasma native QFileDialog crashes."), this);
-        hint->setWordWrap(true);
-        outer->addWidget(hint);
-
-        buttons = new QDialogButtonBox(QDialogButtonBox::Open | QDialogButtonBox::Cancel, this);
-        outer->addWidget(buttons);
-
-        connect(up, &QPushButton::clicked, this, [this]() { setDirectory(currentDir.absolutePath() + QStringLiteral("/..")); });
-        connect(pathEdit, &QLineEdit::returnPressed, this, [this]() { activatePath(pathEdit->text()); });
-        connect(list, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem *item) { activateItem(item); });
-        connect(list, &QListWidget::currentItemChanged, this, [this](QListWidgetItem *item, QListWidgetItem *) { updateSelection(item); });
-        connect(buttons, &QDialogButtonBox::accepted, this, [this]() {
-            if (!selectedFile.isEmpty()) accept();
-            else activatePath(pathEdit->text());
-        });
-        connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
-
-        QString dir = startDir;
-        if (dir.isEmpty()) dir = QDir::homePath();
-        QFileInfo fi(dir);
-        if (fi.isFile()) dir = fi.absolutePath();
-        setDirectory(dir);
-    }
-
-    QString fileName() const { return selectedFile; }
-
-private:
-    void setDirectory(const QString &path)
-    {
-        QDir d(path);
-        if (!d.exists()) d = QDir::home();
-        currentDir = QDir(d.absolutePath());
-        selectedFile.clear();
-        pathEdit->setText(currentDir.absolutePath());
-        list->clear();
-
-        QListWidgetItem *parentItem = new QListWidgetItem(QStringLiteral("../"), list);
-        parentItem->setData(Qt::UserRole, currentDir.absolutePath() + QStringLiteral("/.."));
-        parentItem->setData(Qt::UserRole + 1, true);
-
-        const QFileInfoList dirs = currentDir.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::Readable, QDir::Name | QDir::DirsFirst | QDir::IgnoreCase);
-        for (const QFileInfo &fi : dirs) {
-            QListWidgetItem *item = new QListWidgetItem(fi.fileName() + QStringLiteral("/"), list);
-            item->setData(Qt::UserRole, fi.absoluteFilePath());
-            item->setData(Qt::UserRole + 1, true);
-        }
-
-        const QFileInfoList files = currentDir.entryInfoList(QStringList() << QStringLiteral("*.zip") << QStringLiteral("*.ZIP"), QDir::Files | QDir::Readable, QDir::Name | QDir::IgnoreCase);
-        for (const QFileInfo &fi : files) {
-            QListWidgetItem *item = new QListWidgetItem(fi.fileName(), list);
-            item->setData(Qt::UserRole, fi.absoluteFilePath());
-            item->setData(Qt::UserRole + 1, false);
-        }
-        buttons->button(QDialogButtonBox::Open)->setEnabled(false);
-    }
-
-    void updateSelection(QListWidgetItem *item)
-    {
-        if (!item) {
-            selectedFile.clear();
-            buttons->button(QDialogButtonBox::Open)->setEnabled(false);
-            return;
-        }
-        const QString path = item->data(Qt::UserRole).toString();
-        const bool isDir = item->data(Qt::UserRole + 1).toBool();
-        pathEdit->setText(path);
-        if (isDir) {
-            selectedFile.clear();
-            buttons->button(QDialogButtonBox::Open)->setEnabled(true);
-        } else {
-            selectedFile = path;
-            buttons->button(QDialogButtonBox::Open)->setEnabled(true);
-        }
-    }
-
-    void activateItem(QListWidgetItem *item)
-    {
-        if (!item) return;
-        const QString path = item->data(Qt::UserRole).toString();
-        const bool isDir = item->data(Qt::UserRole + 1).toBool();
-        if (isDir) setDirectory(path);
-        else { selectedFile = path; accept(); }
-    }
-
-    void activatePath(const QString &path)
-    {
-        QFileInfo fi(path);
-        if (fi.isDir()) { setDirectory(fi.absoluteFilePath()); return; }
-        if (fi.isFile()) { selectedFile = fi.absoluteFilePath(); accept(); return; }
-        QMessageBox::warning(this, QStringLiteral("Open ROM"),
-                             QStringLiteral("Path does not exist:\n%1").arg(path));
-    }
-
-    QDir currentDir;
-    QLineEdit *pathEdit = nullptr;
-    QListWidget *list = nullptr;
-    QDialogButtonBox *buttons = nullptr;
-    QString selectedFile;
-};
-
 class VideoWidget final : public QWidget {
 public:
     explicit VideoWidget(QWidget *parent = nullptr) : QWidget(parent)
@@ -390,6 +285,11 @@ public:
         if (!img.isNull()) setMinimumSize(img.width(), img.height());
         update();
     }
+    void setScaleMode(int mode)
+    {
+        scaleMode = clampDisplayScaleMode(mode);
+        update();
+    }
 protected:
     void mousePressEvent(QMouseEvent *event) override
     {
@@ -401,13 +301,32 @@ protected:
         QPainter p(this);
         p.fillRect(rect(), Qt::black);
         if (frame.isNull()) return;
-        const QSize scaled = frame.size().scaled(size(), Qt::KeepAspectRatio);
-        const QRect dst((width() - scaled.width()) / 2, (height() - scaled.height()) / 2, scaled.width(), scaled.height());
+
+        QRect dst = rect();
+        if (scaleMode == kQtScaleInteger) {
+            const int fw = frame.width();
+            const int fh = frame.height();
+            const int sx = fw > 0 ? width() / fw : 1;
+            const int sy = fh > 0 ? height() / fh : 1;
+            const int scale = std::min(sx, sy);
+            if (scale >= 1) {
+                const QSize scaled(fw * scale, fh * scale);
+                dst = QRect((width() - scaled.width()) / 2, (height() - scaled.height()) / 2, scaled.width(), scaled.height());
+            } else {
+                const QSize scaled = frame.size().scaled(size(), Qt::KeepAspectRatio);
+                dst = QRect((width() - scaled.width()) / 2, (height() - scaled.height()) / 2, scaled.width(), scaled.height());
+            }
+        } else if (scaleMode == kQtScaleKeepAspect) {
+            const QSize scaled = frame.size().scaled(size(), Qt::KeepAspectRatio);
+            dst = QRect((width() - scaled.width()) / 2, (height() - scaled.height()) / 2, scaled.width(), scaled.height());
+        }
+
         p.setRenderHint(QPainter::SmoothPixmapTransform, false);
         p.drawImage(dst, frame);
     }
 private:
     QImage frame;
+    int scaleMode = kQtScaleKeepAspect;
 };
 
 class MainWindow final : public QMainWindow {
@@ -416,21 +335,22 @@ public:
     {
         std::memset(&machine, 0, sizeof(machine));
         std::memset(&report, 0, sizeof(report));
-        setWindowTitle(QStringLiteral("CV1000 Qt6"));
+        setWindowTitle(QStringLiteral("CV1KEmu Qt6"));
         setCentralWidget(video);
         setFocusPolicy(Qt::StrongFocus);
         video->setFocus(Qt::OtherFocusReason);
         if (appInstance) appInstance->installEventFilter(this);
-        statusBar()->showMessage(QStringLiteral("Open a CV1000 ROM zip or pass it on the command line."));
+        statusBar()->showMessage(QStringLiteral("Open a CV1K/CV1000 ROM zip or pass it on the command line."));
         makeDefaultKeymap();
         loadSettings();
+        video->setScaleMode(displayScaleMode);
         makeMenus();
         if (cv1k_platform_check() && cv1k_machine_init(&machine, CV1K_MODEL_D)) {
             cv1k_frontend_machine_defaults(&machine);
             applyExecutionMode(false);
             valid = true;
         } else {
-            QMessageBox::critical(this, QStringLiteral("CV1000"), QStringLiteral("Machine initialization failed."));
+            QMessageBox::critical(this, QStringLiteral("CV1KEmu"), QStringLiteral("Machine initialization failed."));
         }
         timer.setTimerType(Qt::PreciseTimer);
         timer.setSingleShot(true);
@@ -440,6 +360,9 @@ public:
         initGamepadInput();
         if (gamepadReady) inputTimer.start(16);
         resize(480, 640);
+        if (fullscreenEnabled) {
+            QTimer::singleShot(0, this, [this]() { applyFullscreenState(false); });
+        }
     }
     ~MainWindow() override
     {
@@ -470,7 +393,7 @@ public:
         const QByteArray localPath = path.toLocal8Bit();
         cv1k_romset_report_clear(&report);
         if (!cv1k_romset_load_ddpsdoj(&machine, localPath.constData(), &report) || !report.ok) {
-            QMessageBox::critical(this, QStringLiteral("CV1000 ROM load failed"), QString::fromLatin1(report.message));
+            QMessageBox::critical(this, QStringLiteral("CV1KEmu ROM load failed"), QString::fromLatin1(report.message));
             statusBar()->showMessage(QString::fromLatin1(report.message));
             return false;
         }
@@ -489,7 +412,7 @@ public:
         if (pauseAction) pauseAction->setChecked(false);
         startAudio();
         frameClock.restart();
-        setWindowTitle(QStringLiteral("CV1000 Qt6 - %1").arg(QString::fromLatin1(report.set_name)));
+        setWindowTitle(QStringLiteral("CV1KEmu Qt6 - %1").arg(QString::fromLatin1(report.set_name)));
         statusBar()->showMessage(QString::fromLatin1(report.message));
         scheduleGameplayKeyboardGrab();
         runOneFrame();
@@ -507,19 +430,31 @@ protected:
         }
         if (event->type() == QEvent::ShortcutOverride) {
             QKeyEvent *keyEvent = static_cast<QKeyEvent *>(event);
-            if (shouldCaptureGameplayKey(keyEvent) && isHandledGameplayKey(keyEvent->key())) {
+            if (shouldCaptureGameplayKey(keyEvent) && (isFullscreenToggleKey(keyEvent) || isHandledGameplayKey(keyEvent->key()))) {
                 event->accept();
                 return true;
             }
         }
         if (event->type() == QEvent::KeyPress || event->type() == QEvent::KeyRelease) {
             QKeyEvent *keyEvent = static_cast<QKeyEvent *>(event);
+            if (event->type() == QEvent::KeyPress && shouldCaptureGameplayKey(keyEvent) && isFullscreenToggleKey(keyEvent)) {
+                setFullscreenEnabled(!fullscreenEnabled, true);
+                event->accept();
+                return true;
+            }
             if (capturePadTarget && event->type() == QEvent::KeyPress) {
                 const int k = keyEvent->key();
                 if (k == Qt::Key_Backspace || k == Qt::Key_Delete || k == Qt::Key_Escape) {
                     finishGamepadCapture(kGamepadNone);
                     return true;
                 }
+            }
+            if (event->type() == QEvent::KeyPress && shouldCaptureGameplayKey(keyEvent)
+                && keyEvent->key() == Qt::Key_Escape
+                && (keyEvent->modifiers() & ~Qt::KeypadModifier) == Qt::NoModifier) {
+                if (fullscreenEnabled) setFullscreenEnabled(false, true);
+                event->accept();
+                return true;
             }
             if (shouldCaptureGameplayKey(keyEvent) && handleGameplayKey(keyEvent, event->type() == QEvent::KeyPress)) return true;
         }
@@ -528,8 +463,26 @@ protected:
 
     void keyPressEvent(QKeyEvent *event) override
     {
+        if (fullscreenEnabled && event->key() == Qt::Key_Escape && event->modifiers() == Qt::NoModifier) {
+            setFullscreenEnabled(false, true);
+            event->accept();
+            return;
+        }
         if (handleGameplayKey(event, true)) return;
         QMainWindow::keyPressEvent(event);
+    }
+    void changeEvent(QEvent *event) override
+    {
+        if (event->type() == QEvent::WindowStateChange) {
+            const bool nowFullscreen = isFullScreen();
+            if (fullscreenEnabled != nowFullscreen) {
+                fullscreenEnabled = nowFullscreen;
+                if (fullscreenAction && fullscreenAction->isChecked() != nowFullscreen) fullscreenAction->setChecked(nowFullscreen);
+                updateFullscreenChrome();
+                saveSettings();
+            }
+        }
+        QMainWindow::changeEvent(event);
     }
     void keyReleaseEvent(QKeyEvent *event) override
     {
@@ -599,6 +552,12 @@ private:
         }
         currentSlot = qBound(0, s.value(QStringLiteral("state/current_slot"), currentSlot).toInt(), 9);
         useIrJit = s.value(QStringLiteral("emulation/ir_jit"), useIrJit).toBool();
+        // Fullscreen is intentionally session-only in the Qt6 frontend.  Do not
+        // restore a stale fullscreen preference on startup; launching directly
+        // into fullscreen can leave users unable to reach menus/window controls
+        // if shortcut delivery is platform-dependent.
+        fullscreenEnabled = false;
+        displayScaleMode = clampDisplayScaleMode(s.value(QStringLiteral("display/scale_mode"), displayScaleMode).toInt());
         lastRomDir = s.value(QStringLiteral("paths/last_rom_dir"), QDir::homePath()).toString();
     }
     void saveSettings()
@@ -611,8 +570,62 @@ private:
         }
         s.setValue(QStringLiteral("state/current_slot"), currentSlot);
         s.setValue(QStringLiteral("emulation/ir_jit"), useIrJit);
+        // Never persist Qt6 fullscreen as a startup default.  Users can still
+        // enter fullscreen for the current session with F11/Alt+Enter/menu.
+        s.setValue(QStringLiteral("display/fullscreen"), false);
+        s.setValue(QStringLiteral("display/scale_mode"), displayScaleMode);
         s.setValue(QStringLiteral("paths/last_rom_dir"), lastRomDir);
     }
+    void updateFullscreenChrome()
+    {
+        if (menuBar()) menuBar()->setVisible(!fullscreenEnabled);
+        if (statusBar()) statusBar()->setVisible(!fullscreenEnabled);
+        if (video) video->setStyleSheet(fullscreenEnabled ? QStringLiteral("background: black;") : QString());
+    }
+
+    void applyFullscreenState(bool showStatus)
+    {
+        if (fullscreenAction && fullscreenAction->isChecked() != fullscreenEnabled) fullscreenAction->setChecked(fullscreenEnabled);
+        updateFullscreenChrome();
+        if (fullscreenEnabled) showFullScreen();
+        else showNormal();
+        scheduleGameplayKeyboardGrab();
+        if (showStatus && !fullscreenEnabled) statusBar()->showMessage(QStringLiteral("Fullscreen disabled."));
+        else if (showStatus) statusBar()->showMessage(QStringLiteral("Fullscreen enabled."));
+    }
+
+    void setFullscreenEnabled(bool enabled, bool persist)
+    {
+        if (fullscreenEnabled == enabled) {
+            if (fullscreenAction && fullscreenAction->isChecked() != enabled) fullscreenAction->setChecked(enabled);
+            return;
+        }
+        fullscreenEnabled = enabled;
+        applyFullscreenState(true);
+        if (persist) saveSettings();
+    }
+
+    void updateDisplayScaleActions()
+    {
+        for (int i = 0; i < 3; ++i) {
+            if (scaleModeActions[i]) scaleModeActions[i]->setChecked(i == displayScaleMode);
+        }
+    }
+
+    void setDisplayScaleMode(int mode, bool persist)
+    {
+        const int clamped = clampDisplayScaleMode(mode);
+        if (displayScaleMode == clamped) {
+            updateDisplayScaleActions();
+            return;
+        }
+        displayScaleMode = clamped;
+        if (video) video->setScaleMode(displayScaleMode);
+        updateDisplayScaleActions();
+        if (persist) saveSettings();
+        if (!fullscreenEnabled) statusBar()->showMessage(QStringLiteral("Display scaling changed."));
+    }
+
     void makeMenus()
     {
         QMenu *file = menuBar()->addMenu(QStringLiteral("&File"));
@@ -655,7 +668,9 @@ private:
             paused = v;
             if (paused) {
                 timer.stop();
+                if (audioSink) audioSink->suspend();
             } else {
+                if (audioSink && audioStarted) audioSink->resume();
                 resumeRunLoop();
             }
             statusBar()->showMessage(v ? QStringLiteral("Paused") : QStringLiteral("Running"));
@@ -674,6 +689,28 @@ private:
             statusBar()->showMessage(on ? QStringLiteral("Execution core: IR JIT") : QStringLiteral("Execution core: interpreter"));
         });
 
+        QMenu *view = menuBar()->addMenu(QStringLiteral("&View"));
+        fullscreenAction = view->addAction(QStringLiteral("&Fullscreen"));
+        fullscreenAction->setCheckable(true);
+        fullscreenAction->setChecked(fullscreenEnabled);
+        fullscreenAction->setShortcut(QKeySequence(Qt::Key_F11));
+        connect(fullscreenAction, &QAction::toggled, this, [this](bool on) { setFullscreenEnabled(on, true); });
+        QShortcut *altEnterFullscreen = new QShortcut(QKeySequence(Qt::ALT | Qt::Key_Return), this);
+        connect(altEnterFullscreen, &QShortcut::activated, this, [this]() { setFullscreenEnabled(!fullscreenEnabled, true); });
+        view->addSeparator();
+        QMenu *scaleMenu = view->addMenu(QStringLiteral("&Scaling"));
+        scaleModeGroup = new QActionGroup(this);
+        scaleModeGroup->setExclusive(true);
+        const char *scaleNames[3] = { "Keep aspect ratio", "Full stretch", "Integer scale" };
+        for (int i = 0; i < 3; ++i) {
+            scaleModeActions[i] = scaleMenu->addAction(QString::fromLatin1(scaleNames[i]));
+            scaleModeActions[i]->setCheckable(true);
+            scaleModeActions[i]->setData(i);
+            scaleModeGroup->addAction(scaleModeActions[i]);
+            connect(scaleModeActions[i], &QAction::triggered, this, [this, i]() { setDisplayScaleMode(i, true); });
+        }
+        updateDisplayScaleActions();
+
         QMenu *options = menuBar()->addMenu(QStringLiteral("&Options"));
         QAction *controls = options->addAction(QStringLiteral("&Controls..."));
         connect(controls, &QAction::triggered, this, [this]() { configureControls(); });
@@ -681,10 +718,14 @@ private:
         connect(settings, &QAction::triggered, this, [this]() { configureSettings(); });
 
         QMenu *help = menuBar()->addMenu(QStringLiteral("&Help"));
-        QAction *about = help->addAction(QStringLiteral("&About CV1000 Qt6"));
+        QAction *about = help->addAction(QStringLiteral("&About CV1KEmu"));
         connect(about, &QAction::triggered, this, [this]() {
-            QMessageBox::about(this, QStringLiteral("CV1000 Qt6"),
-                QStringLiteral("CV1000 Qt6 frontend\n\nFile/slot menu, per-player controls, and selectable interpreter/IR JIT execution mode."));
+            QMessageBox::about(this, QStringLiteral("About CV1KEmu"),
+                QStringLiteral("CV1KEmu Qt6 frontend\n\n"
+                               "Credits:\n"
+                               "• gameblabla: CV1KEmu project, standalone frontends, JIT/performance work, save states, and integration.\n"
+                               "• MAME: original source/reference for the emulation core, including the Cave CV1000 driver/video behavior and related SH-3, NAND, YMZ770, and device logic.\n\n"
+                               "This frontend provides file/slot menus, per-player controls, Qt6 audio/video, and selectable interpreter/IR JIT execution mode."));
         });
         updateSlotMenu();
         updateStateActions();
@@ -693,11 +734,25 @@ private:
     void openRomDialog()
     {
         releaseGameplayKeyboard();
-        SimpleZipOpenDialog dlg(lastRomDir, this);
+
+        QString dir = lastRomDir;
+        if (dir.isEmpty() || !QDir(dir).exists()) dir = QDir::homePath();
+
+        QFileDialog dlg(this, QStringLiteral("Open CV1KEmu ROM zip"), dir);
+        dlg.setOption(QFileDialog::DontUseNativeDialog, true);
+        dlg.setAcceptMode(QFileDialog::AcceptOpen);
+        dlg.setFileMode(QFileDialog::ExistingFile);
+        dlg.setNameFilters(QStringList()
+                           << QStringLiteral("ROM zip files (*.zip *.ZIP)")
+                           << QStringLiteral("All files (*)"));
+        dlg.selectNameFilter(QStringLiteral("ROM zip files (*.zip *.ZIP)"));
+        dlg.setOption(QFileDialog::ReadOnly, true);
+
         if (dlg.exec() == QDialog::Accepted) {
-            const QString file = dlg.fileName();
-            if (!file.isEmpty()) loadRom(file);
+            const QStringList files = dlg.selectedFiles();
+            if (!files.isEmpty() && !files.first().isEmpty()) loadRom(files.first());
         }
+
         scheduleGameplayKeyboardGrab();
     }
 
@@ -791,11 +846,17 @@ private:
     {
         releaseGameplayKeyboard();
         QDialog dlg(this);
-        dlg.setWindowTitle(QStringLiteral("CV1000 Settings"));
-        dlg.resize(440, 220);
+        dlg.setWindowTitle(QStringLiteral("CV1KEmu Settings"));
+        dlg.resize(520, 340);
         QVBoxLayout *outer = new QVBoxLayout(&dlg);
 
-        QGroupBox *coreBox = new QGroupBox(QStringLiteral("Emulation Core"), &dlg);
+        QTabWidget *tabs = new QTabWidget(&dlg);
+        outer->addWidget(tabs, 1);
+
+        QWidget *generalPage = new QWidget(tabs);
+        QVBoxLayout *generalLayout = new QVBoxLayout(generalPage);
+
+        QGroupBox *coreBox = new QGroupBox(QStringLiteral("Emulation Core"), generalPage);
         QFormLayout *coreForm = new QFormLayout(coreBox);
         QComboBox *mode = new QComboBox(coreBox);
         mode->addItem(QStringLiteral("Fast IR JIT / DRC"), true);
@@ -805,15 +866,17 @@ private:
         QLabel *hint = new QLabel(QStringLiteral("The IR JIT is faster. Use the interpreter when debugging correctness or when a game behaves incorrectly."), coreBox);
         hint->setWordWrap(true);
         coreForm->addRow(QString(), hint);
-        outer->addWidget(coreBox);
+        generalLayout->addWidget(coreBox);
 
-        QGroupBox *stateBox = new QGroupBox(QStringLiteral("State Slot"), &dlg);
+        QGroupBox *stateBox = new QGroupBox(QStringLiteral("State Slot"), generalPage);
         QFormLayout *stateForm = new QFormLayout(stateBox);
         QSpinBox *slotSpin = new QSpinBox(stateBox);
         slotSpin->setRange(0, 9);
         slotSpin->setValue(currentSlot);
         stateForm->addRow(QStringLiteral("Current slot"), slotSpin);
-        outer->addWidget(stateBox);
+        generalLayout->addWidget(stateBox);
+        generalLayout->addStretch(1);
+        tabs->addTab(generalPage, QStringLiteral("General"));
 
         QDialogButtonBox *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
         outer->addWidget(buttons);
@@ -886,7 +949,7 @@ private:
         std::vector<KeyButton *> keyButtons;
         std::vector<PadButton *> padButtons;
         QDialog dlg(this);
-        dlg.setWindowTitle(QStringLiteral("CV1000 Controls"));
+        dlg.setWindowTitle(QStringLiteral("CV1KEmu Controls"));
         dlg.resize(760, 560);
         QVBoxLayout *outer = new QVBoxLayout(&dlg);
         QTabWidget *tabs = new QTabWidget(&dlg);
@@ -947,7 +1010,16 @@ private:
 
     bool isHandledGameplayKey(int qtKey) const
     {
-        return qtKey == Qt::Key_Escape || qtKey == Qt::Key_F5 || qtKey == Qt::Key_F8 || isMappedGameplayKey(qtKey);
+        return qtKey == Qt::Key_F5 || qtKey == Qt::Key_F8 || isMappedGameplayKey(qtKey);
+    }
+
+    bool isFullscreenToggleKey(QKeyEvent *event) const
+    {
+        if (event == nullptr) return false;
+        const Qt::KeyboardModifiers mods = event->modifiers() & ~Qt::KeypadModifier;
+        if (event->key() == Qt::Key_F11 && mods == Qt::NoModifier) return true;
+        if ((event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) && mods == Qt::AltModifier) return true;
+        return false;
     }
 
     bool shouldCaptureGameplayKey(QKeyEvent *event) const
@@ -986,7 +1058,6 @@ private:
     bool handleGameplayKey(QKeyEvent *event, bool pressed)
     {
         if (!shouldCaptureGameplayKey(event)) return false;
-        if (pressed && event->key() == Qt::Key_Escape) { close(); event->accept(); return true; }
         if (pressed && event->key() == Qt::Key_F5) { saveStateToCurrentSlot(); event->accept(); return true; }
         if (pressed && event->key() == Qt::Key_F8) { loadStateFromCurrentSlot(); event->accept(); return true; }
         if (!loaded) return false;
@@ -1185,6 +1256,73 @@ private:
         }
 #endif
     }
+    int pendingAudioBytes() const
+    {
+        const int n = audioPending.size() - audioPendingOffset;
+        return n > 0 ? n : 0;
+    }
+
+    void clearAudioQueue()
+    {
+        audioPcm.clear();
+        audioPending.clear();
+        audioPendingOffset = 0;
+    }
+
+    void compactAudioQueueIfUseful()
+    {
+        if (audioPendingOffset <= 0) return;
+        if (audioPendingOffset >= audioPending.size()) {
+            audioPending.clear();
+            audioPendingOffset = 0;
+        } else if (audioPendingOffset >= 8192 || audioPendingOffset * 2 >= audioPending.size()) {
+            audioPending.remove(0, audioPendingOffset);
+            audioPendingOffset = 0;
+        }
+    }
+
+    void trimAudioQueueToLatencyCap()
+    {
+        const int maxBytes = int(kQtAudioPendingMaxFrames * kQtAudioBytesPerFrame);
+        int pending = pendingAudioBytes();
+        if (pending <= maxBytes) return;
+        int drop = pending - maxBytes;
+        drop -= drop % int(kQtAudioBytesPerFrame);
+        if (drop <= 0) return;
+        audioPendingOffset += drop;
+        compactAudioQueueIfUseful();
+    }
+
+    void maybePrimeOrResumeAudio()
+    {
+        if (!audioSink || paused) return;
+        const qint64 queued = audioSink->bufferSize() - audioSink->bytesFree();
+        if (!audioStarted) {
+            if (queued >= qint64(kQtAudioStartFrames * kQtAudioBytesPerFrame)) {
+                audioStarted = true;
+                audioSink->resume();
+            }
+        } else if (audioSink->state() == QAudio::SuspendedState) {
+            audioSink->resume();
+        }
+    }
+
+    void flushAudioQueue()
+    {
+        if (!audioSink || !audioOut) return;
+        compactAudioQueueIfUseful();
+        while (pendingAudioBytes() > 0) {
+            const qint64 freeBytes = audioSink->bytesFree();
+            if (freeBytes <= 0) break;
+            const qint64 wanted = std::min<qint64>(qint64(pendingAudioBytes()), freeBytes);
+            const qint64 written = audioOut->write(audioPending.constData() + audioPendingOffset, wanted);
+            if (written <= 0) break;
+            audioPendingOffset += int(written);
+            compactAudioQueueIfUseful();
+        }
+        maybePrimeOrResumeAudio();
+    }
+
     void startAudio()
     {
         stopAudio();
@@ -1193,10 +1331,29 @@ private:
         fmt.setChannelCount(2);
         fmt.setSampleFormat(QAudioFormat::Int16);
         audioSink = std::make_unique<QAudioSink>(fmt, this);
-        audioSink->setBufferSize(int(kQtAudioMaxLatencyFrames * 2U * sizeof(short)));
+        audioSink->setBufferSize(int(kQtAudioMaxLatencyFrames * kQtAudioBytesPerFrame));
+        connect(audioSink.get(), &QAudioSink::stateChanged, this, [this](QAudio::State state) {
+            if (state == QAudio::IdleState && audioStarted && !paused) {
+                /* Do NOT suspend on host underrun.  In IdleState the audio
+                 * device is still running (just outputting silence); when
+                 * flushAudioQueue() writes new data the sink automatically
+                 * returns to ActiveState with at most a one-frame gap.
+                 *
+                 * Suspending and requiring a full kQtAudioStartFrames
+                 * re-prime (as the previous code did) creates a ~128 ms
+                 * audible cut.  This is especially noticeable when a sound
+                 * effect triggers a brief AMM decode CPU spike on the
+                 * render thread: the QAudioSink buffer drains, underruns,
+                 * and the old code silenced playback for 128 ms before
+                 * resuming.  Headless capture is unaffected because it
+                 * writes to a file with no real-time constraints. */
+            }
+        });
         audioOut = audioSink->start();
+        if (audioSink && audioOut) audioSink->suspend();
         audioAccum = 0;
         audioStarted = false;
+        clearAudioQueue();
     }
 
     void stopAudio()
@@ -1204,7 +1361,7 @@ private:
         if (audioSink) audioSink->stop();
         audioOut = nullptr;
         audioSink.reset();
-        audioPcm.clear();
+        clearAudioQueue();
         audioAccum = 0;
         audioStarted = false;
     }
@@ -1212,34 +1369,17 @@ private:
     void queueAudioForFrame()
     {
         if (!audioSink || !audioOut || !loaded || machine.sound_rom == nullptr || machine.sound_rom_size == 0) return;
+        flushAudioQueue();
+
         const cv1k_u32 frames = cv1k_frontend_audio_frames_for_video(kAudioRate, &audioAccum);
         if (frames == 0U) return;
-        const int bytes = int(frames * 2U * sizeof(short));
+        const int bytes = int(frames * kQtAudioBytesPerFrame);
         if (audioPcm.size() < bytes) audioPcm.resize(bytes);
         cv1k_ymz770_mix_s16_stereo(&machine.ymz, machine.sound_rom, machine.sound_rom_size, reinterpret_cast<short *>(audioPcm.data()), frames);
 
-        if (!audioOut) return;
-        if (audioSink->bytesFree() < bytes) {
-            /* Keep YMZ time locked to video time even if the host audio device is
-             * temporarily behind.  Dropping the current frontend buffer is less
-             * audible than resetting QAudioSink, and it avoids SDL3-inconsistent
-             * audio-thread mixing from live YMZ state. */
-            return;
-        }
-        qint64 written = audioOut->write(audioPcm.constData(), bytes);
-        if (written < 0) written = 0;
-        const char *p = audioPcm.constData() + written;
-        qint64 remain = bytes - written;
-        while (remain > 0 && audioSink->bytesFree() > 0) {
-            const qint64 n = audioOut->write(p, std::min<qint64>(remain, audioSink->bytesFree()));
-            if (n <= 0) break;
-            p += n;
-            remain -= n;
-        }
-        if (!audioStarted) {
-            const int nowQueued = audioSink->bufferSize() - audioSink->bytesFree();
-            if (nowQueued >= int(kQtAudioStartFrames * 2U * sizeof(short))) audioStarted = true;
-        }
+        audioPending.append(audioPcm.constData(), bytes);
+        trimAudioQueueToLatencyCap();
+        flushAudioQueue();
     }
     void presentCurrentFrame()
     {
@@ -1323,6 +1463,8 @@ private:
     int gamepadMap[CV1K_INPUT_COUNT];
     int currentSlot = 0;
     bool useIrJit = true;
+    bool fullscreenEnabled = false;
+    int displayScaleMode = kQtScaleKeepAspect;
     QString lastRomDir;
     cv1k_u32 audioAccum = 0;
     bool audioStarted = false;
@@ -1336,18 +1478,31 @@ private:
     QAction *saveStateAction = nullptr;
     QAction *loadStateAction = nullptr;
     QAction *irJitAction = nullptr;
+    QAction *fullscreenAction = nullptr;
+    QActionGroup *scaleModeGroup = nullptr;
+    QAction *scaleModeActions[3] = { nullptr, nullptr, nullptr };
     QActionGroup *slotGroup = nullptr;
     QAction *slotActions[10] = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
     QIODevice *audioOut = nullptr;
     QByteArray audioPcm;
+    QByteArray audioPending;
+    int audioPendingOffset = 0;
     std::unique_ptr<QAudioSink> audioSink;
 };
 
 int main(int argc, char **argv)
 {
+    /*
+     * Force Qt's own QFileDialog implementation.  Some KDE Plasma/KIO
+     * platform-theme builds crash inside the native helper before our dialog
+     * code can set per-dialog options.  This still uses QFileDialog, but avoids
+     * the buggy KFileWidget/KDirOperator path reported on Arch/KDE.
+     */
+    QCoreApplication::setAttribute(Qt::AA_DontUseNativeDialogs, true);
+
     QApplication app(argc, argv);
-    QCoreApplication::setOrganizationName(QStringLiteral("cv1k"));
-    QCoreApplication::setApplicationName(QStringLiteral("CV1000 Qt6"));
+    QCoreApplication::setOrganizationName(QStringLiteral("CV1KEmu"));
+    QCoreApplication::setApplicationName(QStringLiteral("CV1KEmu Qt6"));
     MainWindow w(&app);
     w.show();
     if (argc > 1) {

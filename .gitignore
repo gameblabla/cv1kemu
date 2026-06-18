@@ -1,0 +1,11 @@
+*.o
+*.a
+build-win64/
+build-qt6/
+cv1kemu_win64.exe
+cv1kemu_qt6
+third_party/sdl/SDL3-3.4.10/
+third_party/sdl/sdl3-mingw/
+third_party/sdl/sdl3-mingw-build/
+release/
+*.sav

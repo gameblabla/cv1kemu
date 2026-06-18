@@ -1,0 +1,101 @@
+# Native Win64 frontend, adapted from the GP32emu native backend structure.
+# Requires a MinGW-w64 C compiler.  Example:
+#   make -f Makefile.win64 ROMSET=mmpork.zip
+CROSS ?= x86_64-w64-mingw32-
+CC ?= $(CROSS)gcc
+WINDRES ?= $(CROSS)windres
+MINGW_PREFIX ?= /usr/$(CROSS)
+SDL3_PREFIX ?= $(CURDIR)/third_party/sdl/sdl3-mingw
+
+# SDL3 is built from third_party/sdl/SDL3-3.4.10.tar.gz for the MinGW target.
+# See the sdl3-mingw target below.  If the built tree exists, SDL3 gamepad
+# input is enabled automatically.
+WITH_SDL3 ?= $(shell test -f $(SDL3_PREFIX)/include/SDL3/SDL.h && echo 1)
+ifeq ($(WITH_SDL3),1)
+SDL3_DEFS = -DCV1K_WIN64_WITH_SDL3
+SDL3_CFLAGS = -I$(SDL3_PREFIX)/include $(SDL3_DEFS)
+SDL3_LIBS = -L$(SDL3_PREFIX)/lib -lSDL3 -lwinmm -limm32 -lole32 -loleaut32 -lversion -luuid -ladvapi32 -lsetupapi -lshell32 -lkernel32 -luser32 -lgdi32
+else
+SDL3_CFLAGS =
+SDL3_LIBS =
+endif
+
+CFLAGS ?= -std=gnu23 -O3 -DNDEBUG -Wall -Wextra -Wno-gnu-case-range -fomit-frame-pointer -DCV1K_WITH_ZLIB -DCV1K_ENABLE_THREADS=0 -Ithird_party $(SDL3_CFLAGS)
+ZLIB_LIBS ?=
+LDFLAGS ?= -mwindows
+BUILD_DIR := build-win64
+BIN := cv1kemu_win64.exe
+
+CORE_SRCS := \
+  src/platform.c \
+  src/cv1k_frontend.c \
+  src/mame_cv1k_derived.c \
+  src/mame_mpeg_audio.c \
+  src/ymz770_mame_audio.c \
+  src/sh3_core.c \
+  src/bus.c \
+  src/emu.c \
+  src/nand.c \
+  src/rtc9701.c \
+  src/sound_ymz770.c \
+  src/video.c \
+  src/input.c \
+  src/savestate.c \
+  src/romset.c \
+  third_party/miniz.c \
+  src/sh3_jit/sh3_jit.c \
+  src/sh3_jit/sh3_jit_x64.c \
+  src/sh3_jit/cv1k_ir.c \
+  src/win64/cv1k_win64_main.c
+OBJS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(CORE_SRCS))
+RES :=
+
+.PHONY: all clean sdl3-mingw clean-sdl3
+all: $(BIN)
+
+# Build SDL3 (static) for the MinGW target.  Requires cmake and ninja/make.
+SDL3_TARBALL := third_party/sdl/SDL3-3.4.10.tar.gz
+SDL3_SRC := third_party/sdl/SDL3-3.4.10
+SDL3_BUILD := third_party/sdl/sdl3-mingw-build
+
+sdl3-mingw:
+	@if test -f $(SDL3_PREFIX)/lib/libSDL3.a; then echo "SDL3 already built."; else \
+	  echo "=== Building SDL3 for $(CROSS) (this is slow, ~3-5 min) ==="; \
+	  test -d $(SDL3_SRC) || tar xzf $(SDL3_TARBALL) -C third_party/sdl; \
+	  mkdir -p $(SDL3_BUILD); \
+	  cmake -S $(SDL3_SRC) -B $(SDL3_BUILD) -G "Unix Makefiles" \
+	    -DCMAKE_TOOLCHAIN_FILE="$(CURDIR)/third_party/sdl/mingw-toolchain.cmake" \
+	    -DCMAKE_INSTALL_PREFIX="$(SDL3_PREFIX)" \
+	    -DCMAKE_BUILD_TYPE=Release \
+	    -DSDL_STATIC=ON \
+	    -DSDL_SHARED=OFF \
+	    -DSDL_TEST_LIBRARY=OFF \
+	    -DSDL_AUDIO=OFF \
+	    -DSDL_VIDEO=OFF \
+	    -DSDL_RENDER=OFF \
+	    -DSDL_HAPTIC=OFF \
+	    -DSDL_SENSOR=OFF \
+	    -DSDL_DIALOG=OFF \
+	    -DSDL_FILESYSTEM=OFF \
+	    -DSDL_LOADSO=OFF \
+	    -DSDL_CLOCK_GETTIME=OFF; \
+	  cmake --build $(SDL3_BUILD) --parallel; \
+	  cmake --install $(SDL3_BUILD); \
+	  echo "=== SDL3 build complete ==="; \
+	fi
+
+clean-sdl3:
+	rm -rf $(SDL3_BUILD) $(SDL3_PREFIX) $(SDL3_SRC)
+
+$(BIN): $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS) $(ZLIB_LIBS) -lwinmm -lgdi32 -luser32 -lcomdlg32 -lcomctl32 -lole32 -lshell32 -lm $(SDL3_LIBS) -static
+
+$(BUILD_DIR)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -Isrc -c $< -o $@
+
+# Optional icon resource support can be re-enabled by adding a RES object here.
+
+
+clean:
+	rm -rf $(BUILD_DIR) $(BIN)
