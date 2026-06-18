@@ -1,5 +1,5 @@
 /*
- * Yamaha YMZ770C register-path scaffold for the CV1000 sandbox.
+ * Yamaha YMZ770C register-path scaffold for CV1KEmu.
  *
  * This does not attempt AMM/MPEG audio decoding.  It ports the MAME YMZ770
  * register-select/data semantics and playback/sequencer bookkeeping into
@@ -58,8 +58,6 @@ static void ymz770_internal_reg_write(struct cv1k_ymz770 *ymz, cv1k_u8 reg, cv1k
             } else if ((data & 6U) == 0U) {
                 if (ymz->channels[ch].playing) ymz->keyoffs++;
                 ymz->channels[ch].playing = 0U;
-                ymz->channels[ch].pending = 0U;
-                ymz->channels[ch].last_block = 0U;
             }
             ymz->channels[ch].loop = (cv1k_u8)((data & 1U) ? 255U : 0U);
             break;
@@ -85,11 +83,7 @@ static void ymz770_internal_reg_write(struct cv1k_ymz770 *ymz, cv1k_u8 reg, cv1k
                 cv1k_u32 i;
                 ymz->sequences[ch].playing = 0U;
                 for (i = 0UL; i < CV1K_YMZ770_CHANNELS; i++) {
-                    if (ymz->sequences[ch].stopchan & (1U << i)) {
-                        ymz->channels[i].playing = 0U;
-                        ymz->channels[i].pending = 0U;
-                        ymz->channels[i].last_block = 0U;
-                    }
+                    if (ymz->sequences[ch].stopchan & (1U << i)) ymz->channels[i].playing = 0U;
                 }
             }
             ymz->sequences[ch].loop = (cv1k_u8)(data & 1U);

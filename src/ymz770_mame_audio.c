@@ -23,6 +23,7 @@ struct cv1k_ymz770_channel_audio {
     int output_ptr;
     int atbl;
     int pptr;
+    int applied_volume2;
 };
 
 struct cv1k_ymz770_audio_impl {
@@ -82,6 +83,7 @@ static void impl_free_decoders(struct cv1k_ymz770_audio_impl *impl)
         impl->ch[i].output_ptr = 0;
         impl->ch[i].atbl = 0;
         impl->ch[i].pptr = 0;
+        impl->ch[i].applied_volume2 = 0;
     }
 }
 
@@ -183,8 +185,6 @@ static void internal_reg_write_from_seq(struct cv1k_ymz770 *ymz, const cv1k_u8 *
             } else if ((data & 6U) == 0U) {
                 if (ymz->channels[ch].playing) ymz->keyoffs++;
                 ymz->channels[ch].playing = 0U;
-                ymz->channels[ch].pending = 0U;
-                ymz->channels[ch].last_block = 0U;
             }
             ymz->channels[ch].loop = (cv1k_u8)((data & 1U) ? 255U : 0U);
             break;
@@ -209,11 +209,7 @@ static void internal_reg_write_from_seq(struct cv1k_ymz770 *ymz, const cv1k_u8 *
             } else if ((data & 6U) == 0U && ymz->sequences[ch].playing) {
                 ymz->sequences[ch].playing = 0U;
                 for (i = 0UL; i < CV1K_YMZ770_CHANNELS; i++) {
-                    if (ymz->sequences[ch].stopchan & (1U << i)) {
-                        ymz->channels[i].playing = 0U;
-                        ymz->channels[i].pending = 0U;
-                        ymz->channels[i].last_block = 0U;
-                    }
+                    if (ymz->sequences[ch].stopchan & (1U << i)) ymz->channels[i].playing = 0U;
                 }
             }
             ymz->sequences[ch].loop = (cv1k_u8)(data & 1U);
@@ -249,11 +245,7 @@ static void run_sequencer(struct cv1k_ymz770 *ymz, const cv1k_u8 *rom, cv1k_u32 
             switch (reg) {
             case 0x0fU:
                 for (ch = 0U; ch < CV1K_YMZ770_CHANNELS; ch++) {
-                    if (seq->stopchan & (1U << ch)) {
-                        ymz->channels[ch].playing = 0U;
-                        ymz->channels[ch].pending = 0U;
-                        ymz->channels[ch].last_block = 0U;
-                    }
+                    if (seq->stopchan & (1U << ch)) ymz->channels[ch].playing = 0U;
                 }
                 if (seq->loop) seq->offset = get_seq_offs(rom, rom_size, seq->sequence);
                 else seq->playing = 0U;
@@ -305,8 +297,13 @@ void cv1k_ymz770_mix_s16_stereo(struct cv1k_ymz770 *ymz,
              * but the software mixer leaks the already-decoded tail for up to
              * ~72 ms at 16 kHz.  Hardware key-off is edge/level immediate for
              * the playback channel, so discard queued decode data as soon as a
-             * channel is off, or when a new key-on is pending over an old buffer. */
-            if (ach->output_remaining > 0 && (!ch->playing || ch->pending)) {
+             * channel is off.  A pending key-on, however, must NOT discard the
+             * current block: MAME lets the decoded samples drain and only
+             * starts the new phrase when the buffer empties, which keeps
+             * phrase-to-phrase transitions seamless (e.g. the DDP Saidaioujou
+             * victory theme briefly dropped when the pending clear cut the
+             * still-playing block mid-decode). */
+            if (ach->output_remaining > 0 && !ch->playing) {
                 clear_channel_decoder(impl, c);
             }
 
@@ -329,7 +326,16 @@ retry_block:
                         cv1k_u32 table = (cv1k_u32)phrase * 4U;
                         ach->atbl = (int)((get_rom_byte(rom, rom_size, table) >> 4) & 7U);
                         ach->pptr = (int)(8U * get_phrase_offs(rom, rom_size, phrase));
-                        clear_channel_decoder(impl, c);
+                        /* Match MAME: phrase transition is seamless most of the
+                         * time.  Only clear the AMM decoder when switching
+                         * phrases mid-block (last_block == false) AND the
+                         * channel volume changed, to avoid audible AMM buffer
+                         * 'contamination'.  Clearing unconditionally resets the
+                         * synthesis overlap buffer and causes a brief amplitude
+                         * dip at every phrase change. */
+                        if (!ch->last_block && (int)ch->volume2 != ach->applied_volume2) {
+                            clear_channel_decoder(impl, c);
+                        }
                         ch->pending = 0U;
                     }
 
@@ -346,6 +352,7 @@ retry_block:
                         ach->output_remaining = out_samples;
                         ach->output_ptr = 0;
                         ch->last_block = (cv1k_u8)(out_samples < 1152 ? 1U : 0U);
+                        ach->applied_volume2 = (int)ch->volume2;
                     }
                 }
             }
